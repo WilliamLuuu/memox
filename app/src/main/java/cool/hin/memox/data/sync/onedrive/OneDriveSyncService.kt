@@ -4,11 +4,19 @@ import android.content.ContextWrapper
 import android.util.Log
 import cool.hin.memox.data.MemoXDatabase
 import cool.hin.memox.data.model.BaseNote
+import cool.hin.memox.data.model.ContentFormat
 import cool.hin.memox.data.model.Converters
 import cool.hin.memox.data.model.Folder
 import cool.hin.memox.data.model.Label
+import cool.hin.memox.data.model.NoteProtection
+import cool.hin.memox.data.model.NoteTombstone
+import cool.hin.memox.data.model.ProtectedPayload
+import cool.hin.memox.data.model.newNoteUuid
+import cool.hin.memox.data.security.NoteCrypto
+import cool.hin.memox.data.security.SecuritySession
 import cool.hin.memox.data.sync.SyncLog
 import cool.hin.memox.data.sync.SyncResult
+import cool.hin.memox.data.sync.SyncOrdering
 import cool.hin.memox.presentation.viewmodel.preference.MemoXPreferences
 import cool.hin.memox.utils.SUBFOLDER_AUDIOS
 import cool.hin.memox.utils.SUBFOLDER_FILES
@@ -28,60 +36,58 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Handles synchronization with OneDrive via the Microsoft Graph API.
  *
- * The remote layout and sync algorithm mirror [WebDavSyncService] so that the
- * behaviour is identical, only the underlying transport differs:
- * - Each note is stored as a separate JSON file: memoX/notes/{title}_{id}.json
- * - Attachments are stored in: memoX/attachments/{images,files,audios}/
- * - Two-way sync based on modifiedTimestamp, with a tombstone list in sync_meta.json
+ * Protocol v2 (mirrors [cool.hin.memox.data.sync.webdav.WebDavSyncService]):
+ * - each note is one JSON file under `memoX/v2/notes/{uuid}.json`, identified by a stable UUID;
+ *   the local auto-increment id never leaves the device;
+ * - every record carries a logical version and a modified timestamp; writes are conditional on
+ *   the eTag read during listing, so a concurrent writer is detected instead of overwritten;
+ * - deletions travel as UUID tombstones in `memoX/v2/sync_meta.json`; a missing remote file is
+ *   never interpreted as "delete locally";
+ * - attachments live under `memoX/v2/attachments/`; encrypted attachments sync as `<name>.enc`.
+ *
+ * The legacy v1 tree (`memoX/notes`, keyed by a device-local id) is left untouched for rollback.
  */
 class OneDriveSyncService(private val context: ContextWrapper) {
 
     companion object {
         private const val TAG = "OneDriveSync"
-        const val REMOTE_DIR = "memoX"
-        const val REMOTE_NOTES_DIR = "memoX/notes"
-        const val REMOTE_IMAGES_DIR = "memoX/attachments/images"
-        const val REMOTE_AUDIOS_DIR = "memoX/attachments/audios"
-        const val REMOTE_FILES_DIR = "memoX/attachments/files"
-        const val REMOTE_SYNC_META = "memoX/sync_meta.json"
-        const val REMOTE_LABELS_FILE = "memoX/labels.json"
+        const val REMOTE_DIR = "memoX/v2"
+        const val REMOTE_NOTES_DIR = "memoX/v2/notes"
+        const val REMOTE_IMAGES_DIR = "memoX/v2/attachments/images"
+        const val REMOTE_AUDIOS_DIR = "memoX/v2/attachments/audios"
+        const val REMOTE_FILES_DIR = "memoX/v2/attachments/files"
+        const val REMOTE_SYNC_META = "memoX/v2/sync_meta.json"
+        const val REMOTE_LABELS_FILE = "memoX/v2/labels.json"
+        const val LEGACY_NOTES_DIR = "memoX/notes"
 
-        /** 附件目录清单，用于一次性建立远端附件索引。 */
-        private val ATTACHMENT_DIRS =
-            listOf(REMOTE_IMAGES_DIR, REMOTE_FILES_DIR, REMOTE_AUDIOS_DIR)
+        /** 附件目录，用于一次性建立远端附件索引。 */
+        private val ATTACHMENT_DIRS = listOf(REMOTE_IMAGES_DIR, REMOTE_FILES_DIR, REMOTE_AUDIOS_DIR)
 
-        /** Generate a safe filename for a note: {title}_{id}.json or {id}.json */
+        /** One file per note, named by stable UUID. */
         fun noteFileName(note: BaseNote): String {
-            val safeTitle = note.title
-                .trim()
-                .replace(Regex("[/\\\\:*?\"<>|\\n\\r]"), "_")
-                .take(50)
-                .trimEnd('_')
-                .trim()
-            return if (safeTitle.isNotEmpty()) "${safeTitle}_${note.id}.json" else "${note.id}.json"
+            val name = note.uuid.ifBlank { note.id.toString() }
+            return "$name.json"
         }
 
-        /** Extract note ID from filename. Format: {title}_{id}.json or {id}.json */
-        fun extractNoteId(fileName: String): Long? {
+        /** Extract the note UUID from a v2 filename. Legacy numeric names return null. */
+        fun extractNoteUuid(fileName: String): String? {
             if (!fileName.endsWith(".json")) return null
             val name = fileName.removeSuffix(".json")
-            name.toLongOrNull()?.let { return it }
-            val lastUnderscore = name.lastIndexOf('_')
-            if (lastUnderscore > 0) {
-                return name.substring(lastUnderscore + 1).toLongOrNull()
-            }
-            return null
+            return name.takeIf { it.length >= 16 && it.contains('-') }
         }
     }
 
     private val preferences: MemoXPreferences by lazy { MemoXPreferences.getInstance(context) }
 
     /**
-     * 远端附件索引：目录 -> (文件名 -> 字节数)。
-     * 供上传/下载/孤儿清理共用，实现"同名+同大小跳过传输"的去重（对齐 WebDAV 版）。
-     * 为 null 表示索引不可用，此时退化为旧的"总是传输"行为，正确性不受影响。
+     * 本次操作期间的远端附件索引：远端目录 -> (文件名 -> 字节数)。
+     * 供上传（同名同大小跳过）、下载（本地已完整则跳过）与孤儿清理共用。
+     * 为 null 表示索引不可用，此时退化为"总是传输"的行为，正确性不受影响。
      */
     private var remoteAttachmentIndex: Map<String, ConcurrentHashMap<String, Long>>? = null
+
+    /** 远端目录是否已确认存在，避免每次同步都无条件发 5 个建目录请求。 */
+    private var remoteDirsEnsured = false
 
     private fun createClient(): OneDriveClient? {
         if (!OneDriveAuthHelper.isLoggedIn(context)) return null
@@ -110,6 +116,7 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         try {
             SyncLog.log("Starting OneDrive upload...")
             ensureRemoteDirs(client)
+            loadRemoteAttachmentIndex(client)
 
             val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
             val dao = database.getBaseNoteDao()
@@ -117,68 +124,53 @@ class OneDriveSyncService(private val context: ContextWrapper) {
 
             SyncLog.log("Found ${allNotes.size} notes to upload")
 
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            val remoteNoteIdToFileNames = mutableMapOf<Long, MutableList<String>>()
-            for (file in remoteFiles) {
-                if (!file.isDirectory && file.name.endsWith(".json")) {
-                    extractNoteId(file.name)?.let { id ->
-                        remoteNoteIdToFileNames.getOrPut(id) { mutableListOf() }.add(file.name)
-                    }
-                }
+            // 安全守卫：本地为空时，拒绝"用空库覆盖服务器"。
+            if (allNotes.isEmpty()) {
+                SyncLog.log("upload: 本地笔记为空，跳过上传以免清空服务器")
+                return@withContext SyncResult.Success("本地无数据，已跳过上传（未改动服务器）")
             }
 
+            // Manual "upload" is a merge: it never deletes remote notes just because they are
+            // absent locally.
             var uploaded = 0
             var failed = 0
 
             for (note in allNotes) {
-                val json = noteToJson(note)
-                val newFileName = noteFileName(note)
-                val path = "$REMOTE_NOTES_DIR/$newFileName"
-                val result = client.upload(path, json.toByteArray(Charsets.UTF_8))
-                if (result.isSuccess) {
-                    uploaded++
-                    val oldFileNames = remoteNoteIdToFileNames.remove(note.id) ?: emptyList()
-                    for (oldName in oldFileNames) {
-                        if (oldName != newFileName) {
-                            client.delete("$REMOTE_NOTES_DIR/$oldName")
-                        }
+                val outcome =
+                    putNote(client = client, note = note, etag = null, createOnly = false)
+                when (outcome) {
+                    ConditionalResult.SUCCESS -> uploaded++
+                    ConditionalResult.PRECONDITION_FAILED -> {
+                        failed++
+                        SyncLog.log("Conditional write rejected for ${note.uuid}")
                     }
-                    uploadAttachments(client, note)
-                } else {
-                    failed++
-                    SyncLog.log("Failed to upload note ${note.id}: ${result.exceptionOrNull()?.message}")
-                }
-            }
-
-            for ((_, fileNames) in remoteNoteIdToFileNames) {
-                for (fileName in fileNames) {
-                    client.delete("$REMOTE_NOTES_DIR/$fileName")
-                    SyncLog.log("Deleted remote note: $fileName")
+                    ConditionalResult.ERROR -> {
+                        failed++
+                        SyncLog.log("Failed to upload note ${note.uuid}")
+                    }
                 }
             }
 
             cleanupOrphanedAttachments(client, allNotes)
             uploadLabels(client)
-            val tombstones = preferences.onedriveDeletedNoteIds.value
-                .mapNotNull { it.toLongOrNull() }
-                .toSet()
-            uploadSyncMeta(client, allNotes.map { it.id }.toSet(), tombstones)
+            uploadSyncMeta(
+                client,
+                MemoXDatabase.getDatabase(context, observePreferences = false)
+                    .value
+                    .getTombstoneDao()
+                    .getAll(),
+            )
 
             preferences.onedriveLastSyncTime.save(System.currentTimeMillis())
-            SyncLog.log("Upload complete: $uploaded uploaded, $failed failed out of ${allNotes.size}")
-            val msg = if (failed > 0) {
-                "Upload: $uploaded/${allNotes.size} notes, $failed failed"
-            } else {
-                "Upload complete: $uploaded notes uploaded"
-            }
-            SyncResult.Success(msg)
+            SyncLog.log("Upload complete: $uploaded uploaded, $failed failed")
+            SyncResult.Success("Upload complete: $uploaded notes uploaded, $failed failed")
         } catch (e: Exception) {
             SyncLog.log("Upload error: ${e.message}")
             SyncResult.Error(e.message ?: "Upload failed")
         }
     }
 
-    /** Download all notes from OneDrive. */
+    /** Download all remote notes. Never deletes a local note that is merely absent remotely. */
     suspend fun download(): SyncResult = withContext(Dispatchers.IO) {
         val client = createClient()
             ?: return@withContext SyncResult.Error("OneDrive not signed in")
@@ -186,248 +178,316 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         try {
             SyncLog.log("Starting OneDrive download...")
             ensureRemoteDirs(client)
+            loadRemoteAttachmentIndex(client)
 
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            val noteFiles = remoteFiles.filter { !it.isDirectory && it.name.endsWith(".json") }
+            val remoteFiles =
+                client.listFiles(REMOTE_NOTES_DIR).getOrElse {
+                    return@withContext SyncResult.Error("Cannot list remote notes: ${it.message}")
+                }
+            val noteFiles =
+                remoteFiles
+                    .filter { !it.isDirectory }
+                    .mapNotNull { file -> extractNoteUuid(file.name)?.let { it to file } }
 
             if (noteFiles.isEmpty()) {
                 SyncLog.log("No remote notes found")
                 return@withContext SyncResult.Error("No notes found on OneDrive")
             }
 
-            SyncLog.log("Found ${noteFiles.size} remote notes")
-
             val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
             val dao = database.getBaseNoteDao()
-            val localIds = dao.getAllIds().toSet()
-
             var downloaded = 0
             var failed = 0
-            val remoteIds = mutableSetOf<Long>()
 
-            for (file in noteFiles) {
-                val noteId = extractNoteId(file.name) ?: continue
-                remoteIds.add(noteId)
-
-                val path = "$REMOTE_NOTES_DIR/${file.name}"
-                val result = client.download(path)
-                result.fold(
-                    onSuccess = { bytes ->
-                        try {
-                            val json = JSONObject(String(bytes, Charsets.UTF_8))
-                            val note = jsonToNote(json)
-                            downloadAttachments(client, note)
-                            dao.insertSafe(context, note)
-                            // 方案 B：云端有、本地没有的文件夹，导入时自动补齐
-                            database.getFolderDao().ensureFolder(note.folderId)
-                            downloaded++
-                        } catch (e: Exception) {
-                            failed++
-                            SyncLog.log("Failed to parse note $noteId: ${e.message}")
-                        }
-                    },
-                    onFailure = { e ->
-                        failed++
-                        SyncLog.log("Failed to download note $noteId: ${e.message}")
-                    }
-                )
-            }
-
-            val deletedIds = localIds - remoteIds
-            if (deletedIds.isNotEmpty()) {
-                dao.delete(deletedIds.toLongArray())
-                SyncLog.log("Deleted ${deletedIds.size} local notes not on OneDrive")
+            for ((uuid, file) in noteFiles) {
+                val bytes = client.download("$REMOTE_NOTES_DIR/${file.name}").getOrNull()
+                if (bytes == null) {
+                    failed++
+                    continue
+                }
+                try {
+                    val note = jsonToNote(JSONObject(String(bytes, Charsets.UTF_8)))
+                    val existing = dao.getByUuid(uuid)
+                    downloadAttachments(client, note)
+                    dao.insertSafe(context, note.copy(id = existing?.id ?: 0, uuid = uuid))
+                    database.getFolderDao().ensureFolder(note.folderId)
+                    downloaded++
+                } catch (e: Exception) {
+                    failed++
+                    SyncLog.log("Failed to parse note $uuid: ${e.message}")
+                }
             }
 
             downloadLabels(client)
 
             preferences.onedriveLastSyncTime.save(System.currentTimeMillis())
             SyncLog.log("Download complete: $downloaded downloaded, $failed failed")
-            SyncResult.Success("Download complete: $downloaded notes downloaded")
+            SyncResult.Success("Download complete: $downloaded notes downloaded, $failed failed")
         } catch (e: Exception) {
             SyncLog.log("Download error: ${e.message}")
             SyncResult.Error(e.message ?: "Download failed")
         }
     }
 
-    /** Two-way sync: upload local changes, download remote changes, handle deletions via tombstones. */
+    /** Two-way sync on stable UUIDs with conditional writes and UUID tombstones. */
     suspend fun sync(): SyncResult = withContext(Dispatchers.IO) {
         val client = createClient()
             ?: return@withContext SyncResult.Error("OneDrive not signed in")
 
         try {
-            SyncLog.log("Starting OneDrive two-way sync...")
+            SyncLog.log("Starting OneDrive two-way sync (v2)...")
             ensureRemoteDirs(client)
             loadRemoteAttachmentIndex(client)
 
             val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
             val dao = database.getBaseNoteDao()
-            val localNotes = dao.getAllNotesIncludingDeleted()
-            val localNoteMap = localNotes.associateBy { it.id }
+            val tombstoneDao = database.getTombstoneDao()
+
+            // Defensive: a row created before the identity migration gets its UUID persisted now.
+            for (note in dao.getAllForSync().filter { it.uuid.isBlank() }) {
+                dao.insertSafe(context, note)
+            }
+            var localNotes = dao.getAllForSync().associateBy { it.uuid }
+
+            // A failed listing means "unknown", never "empty": do not delete or download.
+            val remoteFiles =
+                client.listFiles(REMOTE_NOTES_DIR).getOrElse {
+                    return@withContext SyncResult.Error("Cannot list remote notes: ${it.message}")
+                }
+            val remoteNotes =
+                remoteFiles.filter { !it.isDirectory }.mapNotNull { file ->
+                    extractNoteUuid(file.name)?.let { it to file }
+                }
+            val remoteEtags = remoteNotes.associate { (uuid, file) -> uuid to file.eTag }
+            val remoteJson = mutableMapOf<String, JSONObject>()
+            var fetchFailures = 0
+            for ((uuid, file) in remoteNotes) {
+                val bytes = client.download("$REMOTE_NOTES_DIR/${file.name}").getOrNull()
+                if (bytes == null) {
+                    fetchFailures++
+                    continue
+                }
+                runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }
+                    .onSuccess { remoteJson[uuid] = it }
+                    .onFailure { fetchFailures++ }
+            }
+            val snapshotComplete = fetchFailures == 0
+            if (!snapshotComplete) {
+                SyncLog.log(
+                    "Remote snapshot incomplete ($fetchFailures failures); skipping destructive steps"
+                )
+            }
 
             val remoteMeta = downloadSyncMeta(client)
-            val remoteTombstones = remoteMeta?.deletedNoteIds?.toMutableSet() ?: mutableSetOf()
+            val remoteTombstones = remoteMeta?.tombstones?.associateBy { it.uuid } ?: emptyMap()
+            val localTombstones = tombstoneDao.getAll().associateBy { it.uuid }
+            val mergedTombstones =
+                (remoteTombstones.keys + localTombstones.keys).associateWith { uuid ->
+                    maxOf(
+                        remoteTombstones[uuid]?.deletedAt ?: 0L,
+                        localTombstones[uuid]?.deletedAt ?: 0L,
+                    )
+                }
 
-            val localTombstones = preferences.onedriveDeletedNoteIds.value
-                .mapNotNull { it.toLongOrNull() }
-                .toMutableSet()
-
-            val mergedTombstones = (localTombstones + remoteTombstones).toMutableSet()
-
+            // Apply deletions. A local edit newer than the tombstone wins and is re-published.
             var deletedLocal = 0
-            for (id in mergedTombstones) {
-                val localNote = localNoteMap[id]
-                if (localNote != null) {
-                    dao.delete(longArrayOf(id))
-                    context.deleteAttachments(localNote.images + localNote.files + localNote.audios)
+            for ((uuid, deletedAt) in mergedTombstones) {
+                val local = localNotes[uuid]
+                if (local != null && local.modifiedTimestamp > deletedAt) {
+                    tombstoneDao.removeApplied(uuid)
+                    continue
+                }
+                if (local != null) {
+                    context.deleteAttachments(local.images + local.files + local.audios)
+                    NoteCrypto.clearSession(context, uuid)
+                    dao.deleteByUuid(uuid)
+                    localNotes = localNotes - uuid
                     deletedLocal++
-                    SyncLog.log("Deleted local note $id (tombstone from another device)")
                 }
+                tombstoneDao.upsert(NoteTombstone(uuid, deletedAt, local?.version ?: 0))
             }
 
-            val updatedLocalNotes = dao.getAllNotesIncludingDeleted()
-            val updatedLocalNoteMap = updatedLocalNotes.associateBy { it.id }
-
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            val noteFiles = remoteFiles.filter { !it.isDirectory && it.name.endsWith(".json") }
-
-            val remoteNoteIdToFileNames = mutableMapOf<Long, MutableList<String>>()
-            for (file in noteFiles) {
-                val noteId = extractNoteId(file.name) ?: continue
-                remoteNoteIdToFileNames.getOrPut(noteId) { mutableListOf() }.add(file.name)
-            }
-
-            val remoteNoteMap = mutableMapOf<Long, JSONObject>()
-            for ((noteId, fileNames) in remoteNoteIdToFileNames) {
-                if (noteId in mergedTombstones) continue
-                val fileName = fileNames.last()
-                val result = client.download("$REMOTE_NOTES_DIR/$fileName")
-                result.getOrNull()?.let { bytes ->
-                    try {
-                        remoteNoteMap[noteId] = JSONObject(String(bytes, Charsets.UTF_8))
-                    } catch (_: Exception) {}
-                }
-                if (fileNames.size > 1) {
-                    for (i in 0 until fileNames.size - 1) {
-                        client.delete("$REMOTE_NOTES_DIR/${fileNames[i]}")
-                        SyncLog.log("Deleted duplicate remote file: ${fileNames[i]} for note $noteId")
-                    }
-                }
-            }
-
-            var deletedRemote = 0
-            for (id in mergedTombstones) {
-                val fileNames = remoteNoteIdToFileNames.remove(id)
-                if (fileNames != null) {
-                    for (fileName in fileNames) {
-                        client.delete("$REMOTE_NOTES_DIR/$fileName")
-                    }
-                    val noteJson = remoteNoteMap.remove(id)
-                    if (noteJson != null) {
-                        try {
-                            val note = jsonToNote(noteJson)
-                            for (img in note.images) client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
-                            for (f in note.files) client.delete("$REMOTE_FILES_DIR/${f.localName}")
-                            for (audio in note.audios) client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
-                        } catch (_: Exception) {}
-                    }
-                    deletedRemote++
-                    SyncLog.log("Deleted remote note $id (tombstone)")
-                }
-            }
-
-            val localIds = updatedLocalNoteMap.keys
-            val remoteIds = remoteNoteMap.keys
-
-            var uploaded = 0
+            // Download notes that are new or newer remotely. Inserts keep the local row id.
             var downloaded = 0
+            for ((uuid, json) in remoteJson) {
+                if (uuid in mergedTombstones) continue
+                val local = dao.getByUuid(uuid)
+                val incoming = runCatching { jsonToNote(json) }.getOrNull() ?: continue
+                if (local != null && !isRemoteNewer(json, local)) continue
 
-            for (id in localIds - remoteIds) {
-                val note = updatedLocalNoteMap[id]!!
-                uploadNote(client, note)
-                uploaded++
+                downloadAttachments(client, incoming)
+                dao.insertSafe(context, incoming.copy(id = local?.id ?: 0, uuid = uuid))
+                database.getFolderDao().ensureFolder(incoming.folderId)
+                downloaded++
             }
 
-            for (id in remoteIds - localIds) {
-                val json = remoteNoteMap[id]!!
-                try {
-                    val note = jsonToNote(json)
-                    downloadAttachments(client, note)
-                    dao.insertSafe(context, note)
-                    // 方案 B：云端有、本地没有的文件夹，导入时自动补齐
-                    database.getFolderDao().ensureFolder(note.folderId)
-                    downloaded++
-                } catch (_: Exception) {}
-            }
+            // Upload local changes with a precondition, so concurrent writers are detected.
+            var uploaded = 0
+            var conflicts = 0
+            for (local in dao.getAllForSync()) {
+                if (local.uuid in mergedTombstones) continue
+                val remote = remoteJson[local.uuid]
+                if (remote != null && !isLocalNewer(local, remote)) continue
 
-            for (id in localIds.intersect(remoteIds)) {
-                val local = updatedLocalNoteMap[id]!!
-                val remoteJson = remoteNoteMap[id]!!
-                val remoteTimestamp = remoteJson.optLong("modifiedTimestamp", 0)
-
-                // 相等 = 两端内容一致（数据由同一份迁移而来），跳过上传。
-                // 旧实现用 `>=`，相等也重传，叠加附件无去重后每轮全量重传所有字节。
-                if (local.modifiedTimestamp > remoteTimestamp) {
-                    val newFileName = noteFileName(local)
-                    val oldFileNames = remoteNoteIdToFileNames[id] ?: emptyList()
-                    uploadNote(client, local)
-                    for (oldName in oldFileNames) {
-                        if (oldName != newFileName) {
-                            client.delete("$REMOTE_NOTES_DIR/$oldName")
-                            SyncLog.log("Deleted old remote file: $oldName (renamed to $newFileName)")
+                val outcome =
+                    putNote(
+                        client = client,
+                        note = local,
+                        etag = remoteEtags[local.uuid],
+                        createOnly = remote == null,
+                    )
+                when (outcome) {
+                    ConditionalResult.SUCCESS -> uploaded++
+                    ConditionalResult.PRECONDITION_FAILED -> {
+                        // Lost a race: preserve the other writer's content as a conflict copy.
+                        val fresh =
+                            client
+                                .download("$REMOTE_NOTES_DIR/${noteFileName(local)}")
+                                .getOrNull()
+                                ?.let {
+                                    runCatching { JSONObject(String(it, Charsets.UTF_8)) }
+                                        .getOrNull()
+                                }
+                        if (fresh != null) {
+                            val remoteNote = jsonToNote(fresh)
+                            downloadAttachments(client, remoteNote)
+                            dao.insertSafe(
+                                context,
+                                remoteNote.copy(
+                                    id = 0,
+                                    uuid = newNoteUuid(),
+                                    title =
+                                        if (remoteNote.title.isBlank()) "Conflict"
+                                        else "${remoteNote.title} (conflict)",
+                                    modifiedTimestamp = System.currentTimeMillis(),
+                                ),
+                            )
+                            conflicts++
                         }
                     }
-                    uploaded++
-                } else {
-                    try {
-                        val note = jsonToNote(remoteJson)
-                        downloadAttachments(client, note)
-                        dao.insertSafe(context, note)
-                        // 方案 B：云端有、本地没有的文件夹，导入时自动补齐
-                        database.getFolderDao().ensureFolder(note.folderId)
-                        downloaded++
-                    } catch (_: Exception) {}
+                    ConditionalResult.ERROR -> {
+                        SyncLog.log("Upload failed for ${local.uuid}")
+                    }
                 }
             }
 
-            cleanupOrphanedAttachments(client, updatedLocalNotes)
+            // Orphan cleanup is destructive; only run on a complete remote snapshot.
+            if (snapshotComplete) {
+                cleanupOrphanedAttachments(client, dao.getAllNotesIncludingDeleted())
+            }
             syncLabels(client)
 
-            val currentNoteIds = localIds + remoteIds
-            mergedTombstones.retainAll { it !in currentNoteIds }
-
-            preferences.onedriveDeletedNoteIds.save(mergedTombstones.map { it.toString() }.toSet())
-            uploadSyncMeta(client, updatedLocalNotes.map { it.id }.toSet(), mergedTombstones.toSet())
+            // Push pending deletions, then publish the tombstone set.
+            for (tombstone in tombstoneDao.getPending()) {
+                if (tombstone.protectedContent && !SecuritySession.appUnlocked) {
+                    SyncLog.log("Deferring protected remote deletion for ${tombstone.uuid}")
+                    continue
+                }
+                client.delete("$REMOTE_NOTES_DIR/${tombstone.uuid}.json")
+                tombstoneDao.markRemoteApplied(tombstone.uuid)
+            }
+            uploadSyncMeta(client, tombstoneDao.getAll())
 
             preferences.onedriveLastSyncTime.save(System.currentTimeMillis())
-            SyncLog.log("Sync complete: $uploaded uploaded, $downloaded downloaded, $deletedLocal deleted locally, $deletedRemote deleted remotely, ${mergedTombstones.size} tombstones")
-            SyncResult.Success("Sync complete: $uploaded up, $downloaded down, $deletedLocal local del, $deletedRemote remote del")
+            SyncLog.log(
+                "Sync complete: $uploaded uploaded, $downloaded downloaded, " +
+                    "$deletedLocal deleted locally, $conflicts conflicts"
+            )
+            SyncResult.Success(
+                "Sync complete: $uploaded up, $downloaded down, $deletedLocal local del, $conflicts conflicts"
+            )
         } catch (e: Exception) {
             SyncLog.log("Sync error: ${e.message}")
             SyncResult.Error(e.message ?: "Sync failed")
         }
     }
 
-    private suspend fun ensureRemoteDirs(client: OneDriveClient) {
-        val dirs = listOf(
-            REMOTE_DIR,
-            REMOTE_NOTES_DIR,
-            "memoX/attachments",
-            REMOTE_IMAGES_DIR,
-            REMOTE_AUDIOS_DIR,
-            REMOTE_FILES_DIR,
+    private fun isLocalNewer(local: BaseNote, remote: JSONObject): Boolean =
+        SyncOrdering.isLocalNewer(
+            localVersion = local.version,
+            localModified = local.modifiedTimestamp,
+            remoteVersion = remote.optLong("version", -1),
+            remoteModified = remote.optLong("modifiedTimestamp", 0),
         )
+
+    private fun isRemoteNewer(remote: JSONObject, local: BaseNote): Boolean =
+        SyncOrdering.isRemoteNewer(
+            localVersion = local.version,
+            localModified = local.modifiedTimestamp,
+            remoteVersion = remote.optLong("version", -1),
+            remoteModified = remote.optLong("modifiedTimestamp", 0),
+        )
+
+    private suspend fun putNote(
+        client: OneDriveClient,
+        note: BaseNote,
+        etag: String?,
+        createOnly: Boolean,
+    ): ConditionalResult {
+        val result =
+            client.uploadConditional(
+                path = "$REMOTE_NOTES_DIR/${noteFileName(note)}",
+                data = noteToJson(note).toByteArray(Charsets.UTF_8),
+                ifMatch = etag,
+                createOnly = createOnly,
+            )
+        if (result == ConditionalResult.SUCCESS) {
+            uploadAttachments(client, note)
+        }
+        return result
+    }
+
+    /** Create the v2 folder tree. Graph creates missing parents automatically. */
+    private suspend fun ensureRemoteDirs(client: OneDriveClient) {
+        val dirs =
+            listOf(
+                REMOTE_DIR,
+                REMOTE_NOTES_DIR,
+                REMOTE_IMAGES_DIR,
+                REMOTE_AUDIOS_DIR,
+                REMOTE_FILES_DIR,
+            )
         for (dir in dirs) {
             val result = client.createDirectory(dir)
             if (result.isFailure) {
                 SyncLog.log("Failed to create remote dir '$dir': ${result.exceptionOrNull()?.message}")
             }
         }
+        remoteDirsEnsured = true
+    }
+
+    private suspend fun ensureRemoteDirsOnce(client: OneDriveClient) {
+        if (remoteDirsEnsured) return
+        ensureRemoteDirs(client)
+    }
+
+    /** 一次性拉取三个附件目录的清单，建立索引。 */
+    private suspend fun loadRemoteAttachmentIndex(client: OneDriveClient) {
+        val index = mutableMapOf<String, ConcurrentHashMap<String, Long>>()
+        var anyDirMissing = false
+        for (dir in ATTACHMENT_DIRS) {
+            val map = ConcurrentHashMap<String, Long>()
+            val files = client.listFiles(dir).getOrNull()
+            if (files == null) {
+                anyDirMissing = true
+            } else {
+                for (file in files) if (!file.isDirectory) map[file.name] = file.size
+            }
+            index[dir] = map
+        }
+        // 列不出来通常意味着目录还没建过，补一次；空索引正好等价于"远端什么都没有"
+        if (anyDirMissing) ensureRemoteDirsOnce(client)
+        remoteAttachmentIndex = index
     }
 
     private fun noteToJson(note: BaseNote): String {
         val json = JSONObject()
-        json.put("id", note.id)
+        json.put("schema", 2)
+        json.put("uuid", note.uuid)
+        json.put("version", note.version)
+        json.put("contentFormat", note.contentFormat.name)
+        json.put("protection", note.protection.name)
+        note.payload?.let { json.put("payload", JSONObject(it.toJson())) }
         json.put("type", note.type.name)
         json.put("folder", note.folder.name)
         json.put("color", note.color)
@@ -450,11 +510,21 @@ class OneDriveSyncService(private val context: ContextWrapper) {
     }
 
     private fun jsonToNote(json: JSONObject): BaseNote {
+        val locked = json.optBoolean("locked", false)
+        val protection =
+            json.optString("protection", "")
+                .takeIf { it.isNotEmpty() }
+                ?.let { runCatching { NoteProtection.valueOf(it) }.getOrNull() }
+                ?: if (locked) NoteProtection.LEGACY_LOCK else NoteProtection.NONE
+        val payload =
+            json.optJSONObject("payload")?.let {
+                runCatching { ProtectedPayload.fromJson(it.toString()) }.getOrNull()
+            }
         return BaseNote(
-            id = json.getLong("id"),
+            id = 0,
             type = cool.hin.memox.data.model.Type.valueOfOrDefault(json.getString("type")),
             folder = Folder.valueOf(json.getString("folder")),
-            color = json.getString("color"),
+            color = json.optString("color", BaseNote.COLOR_DEFAULT),
             title = json.optString("title", ""),
             pinned = json.optBoolean("pinned", false),
             timestamp = json.getLong("timestamp"),
@@ -468,21 +538,19 @@ class OneDriveSyncService(private val context: ContextWrapper) {
             audios = Converters.jsonToAudios(JSONArray(json.optString("audios", "[]"))),
             reminders = Converters.jsonToReminders(JSONArray(json.optString("reminders", "[]"))),
             isPinnedToStatus = json.optBoolean("isPinnedToStatus", false),
-            locked = json.optBoolean("locked", false),
+            locked = locked,
             folderId = json.optString("folderId", ""),
+            uuid = json.optString("uuid", ""),
+            version = json.optLong("version", 0),
+            contentFormat =
+                runCatching { ContentFormat.valueOf(json.optString("contentFormat", "RICH_TEXT")) }
+                    .getOrDefault(ContentFormat.RICH_TEXT),
+            protection = protection,
+            payload = payload,
         )
     }
 
-    private suspend fun uploadNote(client: OneDriveClient, note: BaseNote): Result<Unit> {
-        val json = noteToJson(note)
-        val path = "$REMOTE_NOTES_DIR/${noteFileName(note)}"
-        val result = client.upload(path, json.toByteArray(Charsets.UTF_8))
-        if (result.isSuccess) {
-            uploadAttachments(client, note)
-        }
-        return result
-    }
-
+    /** Upload all attachments for a note (skips what OneDrive already has). */
     private suspend fun uploadAttachments(client: OneDriveClient, note: BaseNote) {
         for (img in note.images) {
             uploadAttachment(client, REMOTE_IMAGES_DIR, SUBFOLDER_IMAGES, img.localName)
@@ -496,11 +564,7 @@ class OneDriveSyncService(private val context: ContextWrapper) {
     }
 
     /**
-     * 上传单个附件。远端已存在同名且字节数一致时直接跳过。
-     *
-     * 附件名由本地生成且唯一，"同名 + 同大小"即同一份内容。对齐 WebDAV 版：
-     * 旧实现没有任何校验，只要笔记被判定为需要上传，其全部附件就整体重传一遍，
-     * 在 Graph API 的高延迟下单轮同步可达数分钟，灵动岛长时间停在"同步中"。
+     * 上传单个附件。加密笔记的附件以 `<name>.enc` 上传；远端已有同名且字节数一致时直接跳过。
      */
     private suspend fun uploadAttachment(
         client: OneDriveClient,
@@ -508,20 +572,26 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         subfolder: String,
         name: String,
     ) {
-        val file = getLocalAttachmentFile(subfolder, name)
-        if (file == null || !file.exists()) return
+        val encrypted = NoteCrypto.encryptedAttachmentFile(context, subfolder, name)
+        val remoteName = if (encrypted.exists()) "$name.enc" else name
+        val file = if (encrypted.exists()) encrypted else getLocalAttachmentFile(subfolder, name)
+        if (file == null || !file.exists()) {
+            Log.d(TAG, "uploadAttachment: local file missing, skip $subfolder/$name")
+            return
+        }
         val localSize = file.length()
         val known = remoteAttachmentIndex?.get(remoteDir)
-        if (known != null && known[name] == localSize) return
+        if (known != null && known[remoteName] == localSize) return
 
-        val result = client.upload("$remoteDir/$name", file.readBytes())
+        val result = client.upload("$remoteDir/$remoteName", file.readBytes())
         if (result.isSuccess) {
-            known?.put(name, localSize)
+            known?.put(remoteName, localSize)
         } else {
-            Log.w(TAG, "uploadAttachment: failed $remoteDir/$name: ${result.exceptionOrNull()?.message}")
+            Log.w(TAG, "uploadAttachment: failed $remoteDir/$remoteName: ${result.exceptionOrNull()?.message}")
         }
     }
 
+    /** Download all attachments for a note (skips what is already on disk). */
     private suspend fun downloadAttachments(client: OneDriveClient, note: BaseNote) {
         for (img in note.images) {
             downloadAttachment(client, REMOTE_IMAGES_DIR, SUBFOLDER_IMAGES, img.localName)
@@ -534,15 +604,26 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         }
     }
 
-    /** 下载单个附件。本地已有同名非空文件（且大小与远端一致）时跳过。 */
+    /** 下载单个附件。远端是 `.enc` 时写入本地加密文件；本地已完整则跳过。 */
     private suspend fun downloadAttachment(
         client: OneDriveClient,
         remoteDir: String,
         subfolder: String,
         name: String,
     ) {
-        val localFile = ensureLocalAttachmentFile(subfolder, name) ?: return
-        val remoteSize = remoteAttachmentIndex?.get(remoteDir)?.get(name)
+        val remoteName =
+            if (remoteAttachmentIndex?.get(remoteDir)?.containsKey("$name.enc") == true) {
+                "$name.enc"
+            } else {
+                name
+            }
+        val localFile =
+            if (remoteName.endsWith(".enc")) {
+                NoteCrypto.encryptedAttachmentFile(context, subfolder, name)
+            } else {
+                ensureLocalAttachmentFile(subfolder, name) ?: return
+            }
+        val remoteSize = remoteAttachmentIndex?.get(remoteDir)?.get(remoteName)
         if (
             localFile.exists() &&
                 localFile.length() > 0 &&
@@ -550,7 +631,7 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         ) {
             return
         }
-        client.download("$remoteDir/$name").getOrNull()?.let { bytes ->
+        client.download("$remoteDir/$remoteName").getOrNull()?.let { bytes ->
             localFile.parentFile?.mkdirs()
             localFile.writeBytes(bytes)
         }
@@ -570,11 +651,24 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         return File(dir, localName)
     }
 
+    /** A referenced attachment may exist remotely as plaintext or as an encrypted sibling. */
+    private fun attachmentNames(names: List<String>): Set<String> =
+        names.flatMap { listOf(it, "$it.enc") }.toSet()
+
+    /**
+     * Remove remote attachments that are no longer referenced by any note.
+     *
+     * 安全守卫：本地笔记为空时【绝不】删除服务器附件。
+     */
     private suspend fun cleanupOrphanedAttachments(client: OneDriveClient, allNotes: List<BaseNote>) {
+        if (allNotes.isEmpty()) {
+            SyncLog.log("cleanupOrphanedAttachments: 本地笔记为空，跳过以免误删服务器附件")
+            return
+        }
         try {
-            val referencedImages = allNotes.flatMap { it.images.map { img -> img.localName } }.toSet()
-            val referencedFiles = allNotes.flatMap { it.files.map { f -> f.localName } }.toSet()
-            val referencedAudios = allNotes.flatMap { it.audios.map { a -> a.name } }.toSet()
+            val referencedImages = attachmentNames(allNotes.flatMap { it.images.map { img -> img.localName } })
+            val referencedFiles = attachmentNames(allNotes.flatMap { it.files.map { f -> f.localName } })
+            val referencedAudios = attachmentNames(allNotes.flatMap { it.audios.map { a -> a.name } })
 
             cleanupOrphanedDir(client, REMOTE_IMAGES_DIR, referencedImages)
             cleanupOrphanedDir(client, REMOTE_FILES_DIR, referencedFiles)
@@ -584,26 +678,11 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         }
     }
 
-    /**
-     * 一次性拉取三个附件目录的清单，建立索引（对齐 WebDAV 版）。
-     * 这些请求原本就要在清理孤儿附件时发一遍，现在提前发、全流程共用，总请求数反而更少。
-     */
-    private suspend fun loadRemoteAttachmentIndex(client: OneDriveClient) {
-        val index = mutableMapOf<String, ConcurrentHashMap<String, Long>>()
-        for (dir in ATTACHMENT_DIRS) {
-            val map = ConcurrentHashMap<String, Long>()
-            val files = client.listFiles(dir).getOrNull()
-            if (files != null) {
-                for (file in files) if (!file.isDirectory) map[file.name] = file.size
-            }
-            // 列不出来视为空目录（Graph 路径 PUT 会自动创建父目录，无需补建）
-            index[dir] = map
-        }
-        remoteAttachmentIndex = index
-    }
-
-    private suspend fun cleanupOrphanedDir(client: OneDriveClient, dir: String, referencedNames: Set<String>) {
-        // 优先复用本次同步已建立的索引，避免重复发目录列表请求
+    private suspend fun cleanupOrphanedDir(
+        client: OneDriveClient,
+        dir: String,
+        referencedNames: Set<String>,
+    ) {
         val known = remoteAttachmentIndex?.get(dir)
         val names =
             known?.keys?.toList()
@@ -618,136 +697,120 @@ class OneDriveSyncService(private val context: ContextWrapper) {
         }
     }
 
+    /** Delete a single note and its attachments from OneDrive, and record a UUID tombstone. */
     suspend fun deleteRemoteNote(note: BaseNote) = withContext(Dispatchers.IO) {
         val client = createClient() ?: return@withContext
         try {
-            val currentFileName = noteFileName(note)
-            val idOnlyFileName = "${note.id}.json"
-            client.delete("$REMOTE_NOTES_DIR/$currentFileName")
-            if (currentFileName != idOnlyFileName) {
-                client.delete("$REMOTE_NOTES_DIR/$idOnlyFileName")
-            }
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            for (file in remoteFiles) {
-                if (!file.isDirectory && file.name.endsWith(".json")) {
-                    if (extractNoteId(file.name) == note.id && file.name != currentFileName && file.name != idOnlyFileName) {
-                        client.delete("$REMOTE_NOTES_DIR/${file.name}")
-                    }
-                }
-            }
-            for (img in note.images) client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
-            for (f in note.files) client.delete("$REMOTE_FILES_DIR/${f.localName}")
-            for (audio in note.audios) client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
-            addTombstone(client, note.id)
-            SyncLog.log("Deleted remote note: $currentFileName (and any duplicate files)")
+            client.delete("$REMOTE_NOTES_DIR/${noteFileName(note)}")
+            deleteRemoteAttachments(client, note)
+            addTombstone(note)
+            SyncLog.log("Deleted remote note: ${note.uuid}")
         } catch (e: Exception) {
             Log.w(TAG, "deleteRemoteNote failed: ${e.message}")
         }
     }
 
+    /** Delete multiple notes and their attachments from OneDrive, and record tombstones. */
     suspend fun deleteRemoteNotes(notes: Collection<BaseNote>) = withContext(Dispatchers.IO) {
         val client = createClient() ?: return@withContext
         try {
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-
             for (note in notes) {
-                val currentFileName = noteFileName(note)
-                val idOnlyFileName = "${note.id}.json"
-                client.delete("$REMOTE_NOTES_DIR/$currentFileName")
-                if (currentFileName != idOnlyFileName) {
-                    client.delete("$REMOTE_NOTES_DIR/$idOnlyFileName")
-                }
-                for (file in remoteFiles) {
-                    if (!file.isDirectory && file.name.endsWith(".json")) {
-                        if (extractNoteId(file.name) == note.id && file.name != currentFileName && file.name != idOnlyFileName) {
-                            client.delete("$REMOTE_NOTES_DIR/${file.name}")
-                        }
-                    }
-                }
-                for (img in note.images) client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
-                for (f in note.files) client.delete("$REMOTE_FILES_DIR/${f.localName}")
-                for (audio in note.audios) client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
+                client.delete("$REMOTE_NOTES_DIR/${noteFileName(note)}")
+                deleteRemoteAttachments(client, note)
+                addTombstone(note)
             }
-            addTombstones(client, notes.map { it.id }.toSet())
             SyncLog.log("Deleted ${notes.size} remote notes")
         } catch (e: Exception) {
             Log.w(TAG, "deleteRemoteNotes failed: ${e.message}")
         }
     }
 
-    private suspend fun addTombstone(client: OneDriveClient, noteId: Long) {
-        addTombstones(client, setOf(noteId))
+    private suspend fun deleteRemoteAttachments(client: OneDriveClient, note: BaseNote) {
+        for (img in note.images) {
+            client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
+            client.delete("$REMOTE_IMAGES_DIR/${img.localName}.enc")
+        }
+        for (f in note.files) {
+            client.delete("$REMOTE_FILES_DIR/${f.localName}")
+            client.delete("$REMOTE_FILES_DIR/${f.localName}.enc")
+        }
+        for (audio in note.audios) {
+            client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
+            client.delete("$REMOTE_AUDIOS_DIR/${audio.name}.enc")
+        }
     }
 
-    private suspend fun addTombstones(client: OneDriveClient, noteIds: Set<Long>) {
-        val currentTombstones = preferences.onedriveDeletedNoteIds.value
-            .mapNotNull { it.toLongOrNull() }
-            .toMutableSet()
-        currentTombstones.addAll(noteIds)
-        preferences.onedriveDeletedNoteIds.save(currentTombstones.map { it.toString() }.toSet())
-
-        try {
-            val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
-            val dao = database.getBaseNoteDao()
-            val localIds = dao.getAllIds().toSet()
-            uploadSyncMeta(client, localIds, currentTombstones)
-        } catch (_: Exception) {}
+    /** Record a tombstone locally. The sync loop pushes it with a conditional delete. */
+    private suspend fun addTombstone(note: BaseNote) {
+        if (note.uuid.isBlank()) return
+        val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
+        database
+            .getTombstoneDao()
+            .upsert(
+                NoteTombstone(
+                    uuid = note.uuid,
+                    deletedAt = System.currentTimeMillis(),
+                    version = note.version,
+                    protectedContent = note.protection.isEncrypted,
+                )
+            )
     }
 
-    private suspend fun uploadSyncMeta(client: OneDriveClient, noteIds: Set<Long>, tombstones: Set<Long>) {
+    /** Upload sync metadata. Deletions are UUIDs; local row ids never leave this device. */
+    private suspend fun uploadSyncMeta(client: OneDriveClient, tombstones: List<NoteTombstone>) {
         try {
-            val json = JSONObject().apply {
-                put("lastSyncTime", System.currentTimeMillis())
-                put("noteCount", noteIds.size)
-                put("appVersion", "1.0.5")
-                val idsArray = JSONArray()
-                for (id in noteIds.sorted()) {
-                    idsArray.put(id)
+            val json =
+                JSONObject().apply {
+                    put("schema", 2)
+                    put("lastSyncTime", System.currentTimeMillis())
+                    val array = JSONArray()
+                    for (tombstone in tombstones) {
+                        array.put(
+                            JSONObject()
+                                .put("uuid", tombstone.uuid)
+                                .put("deletedAt", tombstone.deletedAt)
+                                .put("version", tombstone.version)
+                                .put("protectedContent", tombstone.protectedContent)
+                        )
+                    }
+                    put("tombstones", array)
                 }
-                put("syncedNoteIds", idsArray)
-                val deletedArray = JSONArray()
-                for (id in tombstones.sorted()) {
-                    deletedArray.put(id)
-                }
-                put("deletedNoteIds", deletedArray)
-            }
             client.upload(REMOTE_SYNC_META, json.toString().toByteArray(Charsets.UTF_8))
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "uploadSyncMeta failed: ${e.message}")
+        }
     }
 
-    private data class SyncMeta(
-        val syncedNoteIds: Set<Long>,
-        val deletedNoteIds: Set<Long>,
-    )
+    private data class SyncTombstone(val uuid: String, val deletedAt: Long)
 
+    private data class SyncMeta(val tombstones: List<SyncTombstone>)
+
+    /** Download sync metadata */
     private suspend fun downloadSyncMeta(client: OneDriveClient): SyncMeta? {
         return try {
             val result = client.download(REMOTE_SYNC_META)
             val bytes = result.getOrNull() ?: return null
             val json = JSONObject(String(bytes, Charsets.UTF_8))
+            if (json.optInt("schema", 0) < 2) return SyncMeta(emptyList())
 
-            val syncedIds = mutableSetOf<Long>()
-            val syncedArray = json.optJSONArray("syncedNoteIds")
-            if (syncedArray != null) {
-                for (i in 0 until syncedArray.length()) {
-                    syncedIds.add(syncedArray.getLong(i))
+            val tombstones = mutableListOf<SyncTombstone>()
+            val array = json.optJSONArray("tombstones")
+            if (array != null) {
+                for (i in 0 until array.length()) {
+                    val obj = array.optJSONObject(i) ?: continue
+                    val uuid = obj.optString("uuid", "")
+                    if (uuid.isNotEmpty()) {
+                        tombstones.add(SyncTombstone(uuid, obj.optLong("deletedAt", 0)))
+                    }
                 }
             }
-
-            val deletedIds = mutableSetOf<Long>()
-            val deletedArray = json.optJSONArray("deletedNoteIds")
-            if (deletedArray != null) {
-                for (i in 0 until deletedArray.length()) {
-                    deletedIds.add(deletedArray.getLong(i))
-                }
-            }
-
-            SyncMeta(syncedIds, deletedIds)
+            SyncMeta(tombstones)
         } catch (_: Exception) {
             null
         }
     }
 
+    /** Upload labels and hidden labels config to OneDrive. */
     private suspend fun uploadLabels(client: OneDriveClient) {
         try {
             val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
@@ -843,26 +906,19 @@ class OneDriveSyncService(private val context: ContextWrapper) {
                 }
             }
 
-            val mergedLabels = localLabels + remoteLabels
-            val maxOrder = labelDao.getMaxOrder() ?: -1
-
-            val toInsert = mergedLabels - localLabels
-            for ((index, value) in toInsert.withIndex()) {
-                labelDao.insert(Label(value, maxOrder + 1 + index))
+            val merged = (localLabels + remoteLabels).toMutableSet()
+            if (merged != localLabels) {
+                labelDao.deleteAll()
+                labelDao.insert(merged.mapIndexed { index, name -> Label(name, index) })
             }
 
-            // Three-way merge of hidden-label state (base = snapshot from last successful sync)
-            // so that un-hiding (removals) propagates across devices. A plain union would keep a
-            // label hidden forever once any device had hidden it.
             val lastSynced = preferences.labelsHiddenLastSynced.value
-            val mergedHidden = lastSynced.toMutableSet()
-            (remoteHidden - lastSynced).forEach { mergedHidden.add(it) }
+            val mergedHidden = (localHidden + remoteHidden).toMutableSet()
             (lastSynced - remoteHidden).forEach { mergedHidden.remove(it) }
             (localHidden - lastSynced).forEach { mergedHidden.add(it) }
             (lastSynced - localHidden).forEach { mergedHidden.remove(it) }
             preferences.labelsHidden.save(mergedHidden)
 
-            // Upload merged result (uploadLabels also refreshes labelsHiddenLastSynced to mergedHidden)
             uploadLabels(client)
         } catch (e: Exception) {
             Log.w(TAG, "syncLabels: failed: ${e.message}")

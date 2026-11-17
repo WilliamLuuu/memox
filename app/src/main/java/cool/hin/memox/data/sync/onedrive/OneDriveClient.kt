@@ -108,17 +108,61 @@ class OneDriveClient(private val context: Context) {
             false
         }
     }
-
     /** Upload a file (small files < 4 MB use simple PUT; larger use an upload session). */
     suspend fun upload(path: String, data: ByteArray): Result<Unit> {
         return if (data.size < MAX_SIMPLE_UPLOAD) {
-            uploadSimple(path, data)
+            uploadSimple(path, data, ifMatch = null, createOnly = false)
         } else {
-            uploadSession(path, data)
+            uploadSession(path, data, ifMatch = null, createOnly = false)
         }
     }
 
-    private suspend fun uploadSimple(path: String, data: ByteArray): Result<Unit> {
+    /**
+     * Conditional upload: `ifMatch` guards an existing file, `createOnly` refuses to replace one.
+     * A rejected precondition (412, or 409 for `If-None-Match: *`) is reported separately so the
+     * caller can preserve the other writer's content instead of overwriting it.
+     */
+    suspend fun uploadConditional(
+        path: String,
+        data: ByteArray,
+        ifMatch: String?,
+        createOnly: Boolean,
+    ): ConditionalResult {
+        val result =
+            if (data.size < MAX_SIMPLE_UPLOAD) {
+                uploadSimple(path, data, ifMatch, createOnly)
+            } else {
+                uploadSession(path, data, ifMatch, createOnly)
+            }
+        return result.fold(
+            onSuccess = { ConditionalResult.SUCCESS },
+            onFailure = {
+                if (it is OneDrivePreconditionException) {
+                    ConditionalResult.PRECONDITION_FAILED
+                } else {
+                    ConditionalResult.ERROR
+                }
+            },
+        )
+    }
+
+    private fun Request.Builder.condition(ifMatch: String?, createOnly: Boolean): Request.Builder =
+        apply {
+            when {
+                !ifMatch.isNullOrBlank() -> header("If-Match", ifMatch)
+                createOnly -> header("If-None-Match", "*")
+            }
+        }
+
+    private fun preconditionFailure(code: Int, message: String): IOException =
+        if (code == 412 || code == 409) OneDrivePreconditionException(message) else IOException(message)
+
+    private suspend fun uploadSimple(
+        path: String,
+        data: ByteArray,
+        ifMatch: String?,
+        createOnly: Boolean,
+    ): Result<Unit> {
         val token = token() ?: return Result.failure(IOException("Not signed in"))
         return try {
             val request =
@@ -126,22 +170,32 @@ class OneDriveClient(private val context: Context) {
                     .url("$baseUrl${encodePath(path)}:/content")
                     .header("Authorization", "Bearer $token")
                     .header("Content-Type", "application/octet-stream")
+                    .condition(ifMatch, createOnly)
                     .put(data.toRequestBody("application/octet-stream".toMediaType()))
                     .build()
             httpClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful || response.code == 201 || response.code == 204) {
                     Result.success(Unit)
                 } else {
-                    Result.failure(IOException("Upload failed: ${response.code} ${parseError(response.body?.string())}"))
+                    Result.failure(
+                        preconditionFailure(
+                            response.code,
+                            "Upload failed: ${response.code} ${parseError(response.body?.string())}",
+                        )
+                    )
                 }
             }
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
-
     /** Upload a large file (> 4 MB) via a resumable upload session in 5 MB chunks. */
-    private suspend fun uploadSession(path: String, data: ByteArray): Result<Unit> {
+    private suspend fun uploadSession(
+        path: String,
+        data: ByteArray,
+        ifMatch: String?,
+        createOnly: Boolean,
+    ): Result<Unit> {
         val token = token() ?: return Result.failure(IOException("Not signed in"))
         return try {
             // 1. Create the upload session
@@ -154,11 +208,17 @@ class OneDriveClient(private val context: Context) {
                     .url("$baseUrl${encodePath(path)}:/createUploadSession")
                     .header("Authorization", "Bearer $token")
                     .header("Content-Type", "application/json")
+                    .condition(ifMatch, createOnly)
                     .post(sessionBody.toRequestBody("application/json".toMediaType()))
                     .build()
             val uploadUrl: String = httpClient.newCall(sessionRequest).execute().use { response ->
                 if (!response.isSuccessful) {
-                    return Result.failure(IOException("Create upload session failed: ${response.code}"))
+                    return Result.failure(
+                        preconditionFailure(
+                            response.code,
+                            "Create upload session failed: ${response.code}",
+                        )
+                    )
                 }
                 JSONObject(response.body?.string() ?: "{}").getString("uploadUrl")
             }
@@ -322,3 +382,9 @@ data class OneDriveFile(
     /** Graph 的 eTag，内容变化时会变；用于跳过没变过的 note.json 的 GET。 */
     val eTag: String? = null,
 )
+
+/** Outcome of a conditional write; `PRECONDITION_FAILED` means another writer got there first. */
+enum class ConditionalResult { SUCCESS, PRECONDITION_FAILED, ERROR }
+
+/** A 412/409 from Graph: the If-Match / If-None-Match precondition did not hold. */
+class OneDrivePreconditionException(message: String) : IOException(message)

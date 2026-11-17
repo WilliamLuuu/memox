@@ -54,15 +54,16 @@ class WebDavSyncWorker(
         }
 
         /** Trigger an immediate sync after note modification (with 30s debounce) */
-        fun syncNow(context: Context) {
+        fun syncNow(context: Context): Boolean {
             val preferences = MemoXPreferences.getInstance(context)
-            if (!preferences.webdavSyncEnabled.value || !preferences.webdavAutoSync.value) return
+            if (!preferences.webdavSyncEnabled.value || !preferences.webdavAutoSync.value) return false
 
             val request = OneTimeWorkRequest.Builder(WebDavSyncWorker::class.java)
                 .setInitialDelay(5, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(WORK_NAME_IMMEDIATE, ExistingWorkPolicy.REPLACE, request)
+            return true
         }
 
         fun cancel(context: ContextWrapper) {

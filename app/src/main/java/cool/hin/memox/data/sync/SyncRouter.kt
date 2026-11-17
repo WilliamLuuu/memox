@@ -16,13 +16,19 @@ import cool.hin.memox.presentation.viewmodel.preference.MemoXPreferences
  */
 object SyncRouter {
 
-    /** Trigger an immediate (debounced) sync for the active provider, if auto-sync is on. */
-    fun syncNow(context: Context) {
+    /**
+     * Trigger an immediate (debounced) sync for the active provider.
+     *
+     * @return true when a worker was actually enqueued; false when no provider is configured or
+     *     the provider's sync/auto-sync switch is off. Callers such as pull-to-refresh use this
+     *     to stop their spinner instead of waiting for a status change that will never come.
+     */
+    fun syncNow(context: Context): Boolean =
         when (MemoXPreferences.getInstance(context).syncProvider.value) {
             MemoXPreferences.PROVIDER_WEBDAV -> WebDavSyncWorker.syncNow(context)
             MemoXPreferences.PROVIDER_ONEDRIVE -> OneDriveSyncWorker.syncNow(context)
+            else -> false
         }
-    }
 
     /**
      * Schedule (or cancel) the periodic auto-sync. A single AlarmManager-based alarm drives

@@ -40,6 +40,9 @@ class MemoXApplication : Application(), Application.ActivityLifecycleCallbacks {
         if (isTestRunner()) return
         preferences = MemoXPreferences.getInstance(this)
         SyncAlarmScheduler.schedule(this)
+        if (preferences.agentApiEnabled.value) {
+            runCatching { cool.hin.memox.data.agent.AgentApiService.start(this) }
+        }
         if (preferences.useDynamicColors.value) {
             if (DynamicColors.isDynamicColorAvailable()) {
                 DynamicColors.applyToActivitiesIfAvailable(this)

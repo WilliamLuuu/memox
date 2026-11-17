@@ -188,6 +188,42 @@ class WebDavClient(
         }
     }
 
+    /** Result of a conditional upload. */
+    enum class ConditionalResult { SUCCESS, PRECONDITION_FAILED, ERROR }
+
+    /**
+     * PUT with an optional precondition. [ifMatch] must be the ETag read during listing;
+     * use [ifNoneMatchStar] for a create-only upload. A 412 response means another client wrote
+     * the object first and the caller must merge instead of overwriting.
+     */
+    fun uploadConditional(
+        path: String,
+        data: ByteArray,
+        ifMatch: String? = null,
+        ifNoneMatchStar: Boolean = false,
+    ): ConditionalResult {
+        return try {
+            val body = data.toRequestBody("application/octet-stream".toMediaType())
+            val builder =
+                Request.Builder()
+                    .url(buildUrl(path))
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/octet-stream")
+                    .put(body)
+            if (ifMatch != null) builder.header("If-Match", ifMatch)
+            if (ifNoneMatchStar) builder.header("If-None-Match", "*")
+            val response = httpClient.newCall(builder.build()).execute()
+            when {
+                response.isSuccessful || response.code == 201 || response.code == 204 ->
+                    ConditionalResult.SUCCESS
+                response.code == 412 -> ConditionalResult.PRECONDITION_FAILED
+                else -> ConditionalResult.ERROR
+            }
+        } catch (_: Exception) {
+            ConditionalResult.ERROR
+        }
+    }
+
     /** List files in a directory (PROPFIND) */
     fun listFiles(path: String): Result<List<WebDavFile>> {
         return try {
@@ -198,6 +234,7 @@ class WebDavClient(
                     <d:prop>
                         <d:getlastmodified/>
                         <d:getcontentlength/>
+                        <d:getetag/>
                         <d:resourcetype/>
                     </d:prop>
                 </d:propfind>
@@ -265,7 +302,9 @@ class WebDavClient(
                 val contentLengthElem =
                     responseElem.getElementsByTagNameNS("DAV:", "getcontentlength").item(0)
                 val contentLength = contentLengthElem?.textContent?.toLongOrNull() ?: 0L
-
+                // Get ETag: required for conditional writes.
+                val etagElem = responseElem.getElementsByTagNameNS("DAV:", "getetag").item(0)
+                val etag = etagElem?.textContent?.trim('"', ' ')
                 files.add(
                     WebDavFile(
                         name = fileName,
@@ -273,6 +312,7 @@ class WebDavClient(
                         isDirectory = isDirectory,
                         lastModified = lastModified,
                         size = contentLength,
+                        etag = etag,
                     )
                 )
             }
@@ -301,4 +341,5 @@ data class WebDavFile(
     val isDirectory: Boolean,
     val lastModified: String?,
     val size: Long,
+    val etag: String? = null,
 )

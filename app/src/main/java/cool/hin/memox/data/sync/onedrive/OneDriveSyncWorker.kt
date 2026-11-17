@@ -56,15 +56,16 @@ class OneDriveSyncWorker(
             SyncAlarmScheduler.schedule(context)
         }
 
-        fun syncNow(context: Context) {
+        fun syncNow(context: Context): Boolean {
             val preferences = MemoXPreferences.getInstance(context)
-            if (!preferences.onedriveSyncEnabled.value || !preferences.onedriveAutoSync.value) return
+            if (!preferences.onedriveSyncEnabled.value || !preferences.onedriveAutoSync.value) return false
 
             val request = OneTimeWorkRequest.Builder(OneDriveSyncWorker::class.java)
                 .setInitialDelay(5, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(WORK_NAME_IMMEDIATE, ExistingWorkPolicy.REPLACE, request)
+            return true
         }
 
         fun cancel(context: ContextWrapper) {

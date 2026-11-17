@@ -5,10 +5,18 @@ import android.util.Log
 import cool.hin.memox.data.MemoXDatabase
 import cool.hin.memox.data.model.BaseNote
 import cool.hin.memox.data.model.Converters
+import cool.hin.memox.data.model.ContentFormat
 import cool.hin.memox.data.model.Folder
 import cool.hin.memox.data.model.Label
+import cool.hin.memox.data.model.NoteProtection
+import cool.hin.memox.data.model.NoteTombstone
+import cool.hin.memox.data.model.ProtectedPayload
+import cool.hin.memox.data.model.newNoteUuid
+import cool.hin.memox.data.security.NoteCrypto
+import cool.hin.memox.data.security.SecuritySession
 import cool.hin.memox.data.sync.SyncLog
 import cool.hin.memox.data.sync.SyncMetaCache
+import cool.hin.memox.data.sync.SyncOrdering
 import cool.hin.memox.data.sync.SyncResult
 import cool.hin.memox.presentation.viewmodel.preference.MemoXPreferences
 import cool.hin.memox.utils.SUBFOLDER_AUDIOS
@@ -34,55 +42,46 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Handles synchronization with a WebDAV server.
  *
- * Strategy:
- * - Each note is stored as a separate JSON file: memoX/notes/{title}_{id}.json
- * - If note has no title, filename is: memoX/notes/{id}.json
- * - Attachments are stored in: memoX/attachments/images/, memoX/attachments/audios/, memoX/attachments/files/
- * - Upload: Upload all notes and their attachments, delete remote notes no longer local
- * - Download: Download all notes and their attachments, delete local notes no longer remote
- * - Sync: Two-way sync based on modifiedTimestamp - newer version wins
+ * Protocol v2:
+ * - each note is one JSON file under `memoX/v2/notes/{uuid}.json`, identified by a stable UUID;
+ *   the local auto-increment id never leaves the device;
+ * - every record carries a logical version and a modified timestamp; writes are conditional on
+ *   the ETag read during listing, so a concurrent writer is detected instead of overwritten;
+ * - deletions travel as UUID tombstones in `memoX/v2/sync_meta.json`; a missing remote file is
+ *   never interpreted as "delete locally";
+ * - attachments live under `memoX/v2/attachments/`; encrypted attachments sync as `<name>.enc`.
+ *
+ * The legacy v1 tree (`memoX/notes`, keyed by a device-local id) is left untouched for rollback.
  */
 class WebDavSyncService(private val context: ContextWrapper) {
 
     companion object {
         private const val TAG = "WebDavSync"
-        const val REMOTE_DIR = "memoX"
-        const val REMOTE_NOTES_DIR = "memoX/notes"
-        const val REMOTE_IMAGES_DIR = "memoX/attachments/images"
-        const val REMOTE_AUDIOS_DIR = "memoX/attachments/audios"
-        const val REMOTE_FILES_DIR = "memoX/attachments/files"
-        const val REMOTE_SYNC_META = "memoX/sync_meta.json"
-        const val REMOTE_LABELS_FILE = "memoX/labels.json"
-
+        const val REMOTE_DIR = "memoX/v2"
+        const val REMOTE_NOTES_DIR = "memoX/v2/notes"
+        const val REMOTE_IMAGES_DIR = "memoX/v2/attachments/images"
+        const val REMOTE_AUDIOS_DIR = "memoX/v2/attachments/audios"
+        const val REMOTE_FILES_DIR = "memoX/v2/attachments/files"
+        const val REMOTE_SYNC_META = "memoX/v2/sync_meta.json"
+        const val REMOTE_LABELS_FILE = "memoX/v2/labels.json"
+        const val LEGACY_NOTES_DIR = "memoX/notes"
         /** 附件目录，用于一次性建立远端附件索引。 */
         private val ATTACHMENT_DIRS = listOf(REMOTE_IMAGES_DIR, REMOTE_FILES_DIR, REMOTE_AUDIOS_DIR)
 
         /** 并发上限。取小值以免部分 WebDAV 网关限速或返回 429。 */
         private const val SYNC_CONCURRENCY = 4
 
-        /** Generate a safe filename for a note: {title}_{id}.json or {id}.json */
+        /** One file per note, named by stable UUID. */
         fun noteFileName(note: BaseNote): String {
-            val safeTitle = note.title
-                .trim()
-                .replace(Regex("[/\\\\:*?\"<>|\\n\\r]"), "_")
-                .take(50)
-                .trimEnd('_')
-                .trim()
-            return if (safeTitle.isNotEmpty()) "${safeTitle}_${note.id}.json" else "${note.id}.json"
+            val name = note.uuid.ifBlank { note.id.toString() }
+            return "$name.json"
         }
 
-        /** Extract note ID from filename. Format: {title}_{id}.json or {id}.json */
-        fun extractNoteId(fileName: String): Long? {
+        /** Extract the note UUID from a v2 filename. Legacy numeric names return null. */
+        fun extractNoteUuid(fileName: String): String? {
             if (!fileName.endsWith(".json")) return null
             val name = fileName.removeSuffix(".json")
-            // Try to parse as plain ID first (old format: 123.json)
-            name.toLongOrNull()?.let { return it }
-            // New format: {title}_{id}.json - extract ID from the last _{digits}
-            val lastUnderscore = name.lastIndexOf('_')
-            if (lastUnderscore > 0) {
-                return name.substring(lastUnderscore + 1).toLongOrNull()
-            }
-            return null
+            return name.takeIf { it.length >= 16 && it.contains('-') }
         }
     }
 
@@ -150,56 +149,36 @@ class WebDavSyncService(private val context: ContextWrapper) {
                 return@withContext SyncResult.Success("本地无数据，已跳过上传（未改动服务器）")
             }
 
-            // Get list of existing remote note files (map: noteId -> list of filenames, to handle duplicates)
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            val remoteNoteIdToFileNames = mutableMapOf<Long, MutableList<String>>()
-            for (file in remoteFiles) {
-                if (!file.isDirectory && file.name.endsWith(".json")) {
-                    extractNoteId(file.name)?.let { id ->
-                        remoteNoteIdToFileNames.getOrPut(id) { mutableListOf() }.add(file.name)
-                    }
-                }
-            }
-
+            // Manual "upload" is a merge: it never deletes remote notes just because they are
+            // absent locally. Replacing the server is a separate, explicitly confirmed action.
             var uploaded = 0
             var failed = 0
 
-            // Upload each note
             for (note in allNotes) {
-                val json = noteToJson(note)
-                val newFileName = noteFileName(note)
-                val path = "$REMOTE_NOTES_DIR/$newFileName"
-                val result = client.upload(path, json.toByteArray(Charsets.UTF_8))
-                if (result.isSuccess) {
-                    uploaded++
-                    // Delete old files if filename changed or duplicates exist
-                    val oldFileNames = remoteNoteIdToFileNames.remove(note.id) ?: emptyList()
-                    for (oldName in oldFileNames) {
-                        if (oldName != newFileName) {
-                            client.delete("$REMOTE_NOTES_DIR/$oldName")
-                        }
+                val outcome =
+                    putNote(client = client, note = note, etag = null, createOnly = false)
+                when (outcome) {
+                    WebDavClient.ConditionalResult.SUCCESS -> uploaded++
+                    WebDavClient.ConditionalResult.PRECONDITION_FAILED -> {
+                        failed++
+                        SyncLog.log("Conditional write rejected for ${note.uuid}")
                     }
-                    uploadAttachments(client, note)
-                } else {
-                    failed++
-                    SyncLog.log("Failed to upload note ${note.id}: ${result.exceptionOrNull()?.message}")
-                }
-            }
-
-            // Delete remote notes that no longer exist locally
-            for ((_, fileNames) in remoteNoteIdToFileNames) {
-                for (fileName in fileNames) {
-                    client.delete("$REMOTE_NOTES_DIR/$fileName")
-                    SyncLog.log("Deleted remote note: $fileName")
+                    WebDavClient.ConditionalResult.ERROR -> {
+                        failed++
+                        SyncLog.log("Failed to upload note ${note.uuid}")
+                    }
                 }
             }
 
             cleanupOrphanedAttachments(client, allNotes)
             uploadLabels(client)
-            val tombstones = preferences.webdavDeletedNoteIds.value
-                .mapNotNull { it.toLongOrNull() }
-                .toSet()
-            uploadSyncMeta(client, allNotes.map { it.id }.toSet(), tombstones)
+            uploadSyncMeta(
+                client,
+                MemoXDatabase.getDatabase(context, observePreferences = false)
+                    .value
+                    .getTombstoneDao()
+                    .getAll(),
+            )
 
             preferences.webdavLastSyncTime.save(System.currentTimeMillis())
             SyncLog.log("Upload complete: $uploaded uploaded, $failed failed")
@@ -210,7 +189,7 @@ class WebDavSyncService(private val context: ContextWrapper) {
         }
     }
 
-    /** Download all notes from WebDAV */
+    /** Download all remote notes. Never deletes a local note that is merely absent remotely. */
     suspend fun download(): SyncResult = withContext(Dispatchers.IO) {
         val client = createClient()
             ?: return@withContext SyncResult.Error("WebDAV not configured")
@@ -218,247 +197,263 @@ class WebDavSyncService(private val context: ContextWrapper) {
         try {
             SyncLog.log("Starting WebDAV download...")
             ensureRemoteDirs(client)
+            loadRemoteAttachmentIndex(client)
 
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            val noteFiles = remoteFiles.filter { !it.isDirectory && it.name.endsWith(".json") }
+            val remoteFiles =
+                client.listFiles(REMOTE_NOTES_DIR).getOrElse {
+                    return@withContext SyncResult.Error("Cannot list remote notes: ${it.message}")
+                }
+            val noteFiles =
+                remoteFiles
+                    .filter { !it.isDirectory }
+                    .mapNotNull { file -> extractNoteUuid(file.name)?.let { it to file } }
 
             if (noteFiles.isEmpty()) {
                 SyncLog.log("No remote notes found")
                 return@withContext SyncResult.Error("No notes found on server")
             }
 
-            SyncLog.log("Found ${noteFiles.size} remote notes")
-
             val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
             val dao = database.getBaseNoteDao()
-            val localIds = dao.getAllIds().toSet()
-
             var downloaded = 0
             var failed = 0
-            val remoteIds = mutableSetOf<Long>()
 
-            for (file in noteFiles) {
-                val noteId = extractNoteId(file.name) ?: continue
-                remoteIds.add(noteId)
-
-                val path = "$REMOTE_NOTES_DIR/${file.name}"
-                val result = client.download(path)
-                result.fold(
-                    onSuccess = { bytes ->
-                        try {
-                            val json = JSONObject(String(bytes, Charsets.UTF_8))
-                            val note = jsonToNote(json)
-                            downloadAttachments(client, note)
-                            dao.insertSafe(context, note)
-                            // 方案 B：云端有、本地没有的文件夹，导入时自动补齐
-                            database.getFolderDao().ensureFolder(note.folderId)
-                            downloaded++
-                        } catch (e: Exception) {
-                            failed++
-                            SyncLog.log("Failed to parse note $noteId: ${e.message}")
-                        }
-                    },
-                    onFailure = { e ->
-                        failed++
-                        SyncLog.log("Failed to download note $noteId: ${e.message}")
-                    }
-                )
-            }
-
-            // Delete local notes that no longer exist remotely
-            val deletedIds = localIds - remoteIds
-            if (deletedIds.isNotEmpty()) {
-                dao.delete(deletedIds.toLongArray())
-                SyncLog.log("Deleted ${deletedIds.size} local notes not on server")
+            for ((uuid, file) in noteFiles) {
+                val bytes = client.download("$REMOTE_NOTES_DIR/${file.name}").getOrNull()
+                if (bytes == null) {
+                    failed++
+                    continue
+                }
+                try {
+                    val note = jsonToNote(JSONObject(String(bytes, Charsets.UTF_8)))
+                    val existing = dao.getByUuid(uuid)
+                    downloadAttachments(client, note)
+                    dao.insertSafe(context, note.copy(id = existing?.id ?: 0, uuid = uuid))
+                    database.getFolderDao().ensureFolder(note.folderId)
+                    downloaded++
+                } catch (e: Exception) {
+                    failed++
+                    SyncLog.log("Failed to parse note $uuid: ${e.message}")
+                }
             }
 
             downloadLabels(client)
 
             preferences.webdavLastSyncTime.save(System.currentTimeMillis())
             SyncLog.log("Download complete: $downloaded downloaded, $failed failed")
-            SyncResult.Success("Download complete: $downloaded notes downloaded")
+            SyncResult.Success("Download complete: $downloaded notes downloaded, $failed failed")
         } catch (e: Exception) {
             SyncLog.log("Download error: ${e.message}")
             SyncResult.Error(e.message ?: "Download failed")
         }
     }
 
-    /** Two-way sync: upload local changes, download remote changes, handle deletions via tombstones */
+    /** Two-way sync on stable UUIDs with conditional writes and UUID tombstones. */
     suspend fun sync(): SyncResult = withContext(Dispatchers.IO) {
         val client = createClient()
             ?: return@withContext SyncResult.Error("WebDAV not configured")
 
         try {
-            SyncLog.log("Starting WebDAV two-way sync...")
+            SyncLog.log("Starting WebDAV two-way sync (v2)...")
             ensureRemoteDirs(client)
+            loadRemoteAttachmentIndex(client)
 
             val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
             val dao = database.getBaseNoteDao()
-            val localNotes = dao.getAllNotesIncludingDeleted()
-            val localNoteMap = localNotes.associateBy { it.id }
+            val tombstoneDao = database.getTombstoneDao()
 
-            // Download remote sync_meta to get tombstones (deletedNoteIds)
+            // Defensive: a row created before the identity migration gets its UUID persisted now.
+            for (note in dao.getAllForSync().filter { it.uuid.isBlank() }) {
+                dao.insertSafe(context, note)
+            }
+            var localNotes = dao.getAllForSync().associateBy { it.uuid }
+
+            // A failed listing means "unknown", never "empty": do not delete or download.
+            val remoteFiles =
+                client.listFiles(REMOTE_NOTES_DIR).getOrElse {
+                    return@withContext SyncResult.Error("Cannot list remote notes: ${it.message}")
+                }
+            val remoteNotes =
+                remoteFiles.filter { !it.isDirectory }.mapNotNull { file ->
+                    extractNoteUuid(file.name)?.let { it to file }
+                }
+            val remoteEtags = remoteNotes.associate { (uuid, file) -> uuid to file.etag }
+            val remoteJson = mutableMapOf<String, JSONObject>()
+            var fetchFailures = 0
+            for ((uuid, file) in remoteNotes) {
+                val bytes = client.download("$REMOTE_NOTES_DIR/${file.name}").getOrNull()
+                if (bytes == null) {
+                    fetchFailures++
+                    continue
+                }
+                runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }
+                    .onSuccess { remoteJson[uuid] = it }
+                    .onFailure { fetchFailures++ }
+            }
+            val snapshotComplete = fetchFailures == 0
+            if (!snapshotComplete) {
+                SyncLog.log(
+                    "Remote snapshot incomplete ($fetchFailures failures); skipping destructive steps"
+                )
+            }
+
             val remoteMeta = downloadSyncMeta(client)
-            val remoteTombstones = remoteMeta?.deletedNoteIds?.toMutableSet() ?: mutableSetOf()
+            val remoteTombstones = remoteMeta?.tombstones?.associateBy { it.uuid } ?: emptyMap()
+            val localTombstones = tombstoneDao.getAll().associateBy { it.uuid }
+            val mergedTombstones =
+                (remoteTombstones.keys + localTombstones.keys).associateWith { uuid ->
+                    maxOf(
+                        remoteTombstones[uuid]?.deletedAt ?: 0L,
+                        localTombstones[uuid]?.deletedAt ?: 0L,
+                    )
+                }
 
-            // Get local tombstones
-            val localTombstones = preferences.webdavDeletedNoteIds.value
-                .mapNotNull { it.toLongOrNull() }
-                .toMutableSet()
-
-            // Merge tombstones: union of local and remote
-            val mergedTombstones = (localTombstones + remoteTombstones).toMutableSet()
-
-            // Apply remote tombstones locally: delete local notes that were deleted on another device
+            // Apply deletions. A local edit newer than the tombstone wins and is re-published.
             var deletedLocal = 0
-            for (id in mergedTombstones) {
-                val localNote = localNoteMap[id]
-                if (localNote != null) {
-                    dao.delete(longArrayOf(id))
-                    context.deleteAttachments(localNote.images + localNote.files + localNote.audios)
+            for ((uuid, deletedAt) in mergedTombstones) {
+                val local = localNotes[uuid]
+                if (local != null && local.modifiedTimestamp > deletedAt) {
+                    tombstoneDao.removeApplied(uuid)
+                    continue
+                }
+                if (local != null) {
+                    context.deleteAttachments(local.images + local.files + local.audios)
+                    NoteCrypto.clearSession(context, uuid)
+                    dao.deleteByUuid(uuid)
+                    localNotes = localNotes - uuid
                     deletedLocal++
-                    SyncLog.log("Deleted local note $id (tombstone from another device)")
                 }
+                tombstoneDao.upsert(NoteTombstone(uuid, deletedAt, local?.version ?: 0))
             }
 
-            // Re-read local notes after applying tombstones
-            val updatedLocalNotes = dao.getAllNotesIncludingDeleted()
-            val updatedLocalNoteMap = updatedLocalNotes.associateBy { it.id }
-
-            // Get remote note list - track ALL filenames per note ID to detect duplicates
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            val noteFiles = remoteFiles.filter { !it.isDirectory && it.name.endsWith(".json") }
-
-            // Map: noteId -> list of filenames (to detect and clean up duplicates)
-            val remoteNoteIdToFileNames = mutableMapOf<Long, MutableList<String>>()
-            for (file in noteFiles) {
-                val noteId = extractNoteId(file.name) ?: continue
-                remoteNoteIdToFileNames.getOrPut(noteId) { mutableListOf() }.add(file.name)
-            }
-
-            // Download and parse remote notes (use the last file if duplicates exist)
-            val remoteNoteMap = mutableMapOf<Long, JSONObject>()
-            for ((noteId, fileNames) in remoteNoteIdToFileNames) {
-                // Skip notes in tombstones (they were deleted)
-                if (noteId in mergedTombstones) continue
-                // Use the last filename (most recent upload) for the note data
-                val fileName = fileNames.last()
-                val result = client.download("$REMOTE_NOTES_DIR/$fileName")
-                result.getOrNull()?.let { bytes ->
-                    try {
-                        remoteNoteMap[noteId] = JSONObject(String(bytes, Charsets.UTF_8))
-                    } catch (_: Exception) {}
-                }
-                // Clean up duplicate files for the same note ID
-                if (fileNames.size > 1) {
-                    for (i in 0 until fileNames.size - 1) {
-                        client.delete("$REMOTE_NOTES_DIR/${fileNames[i]}")
-                        SyncLog.log("Deleted duplicate remote file: ${fileNames[i]} for note $noteId")
-                    }
-                }
-            }
-
-            // Delete remote notes that are in tombstones
-            var deletedRemote = 0
-            for (id in mergedTombstones) {
-                val fileNames = remoteNoteIdToFileNames.remove(id)
-                if (fileNames != null) {
-                    for (fileName in fileNames) {
-                        client.delete("$REMOTE_NOTES_DIR/$fileName")
-                    }
-                    // Also delete remote attachments (try to get from remote data)
-                    val noteJson = remoteNoteMap.remove(id)
-                    if (noteJson != null) {
-                        try {
-                            val note = jsonToNote(noteJson)
-                            for (img in note.images) client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
-                            for (f in note.files) client.delete("$REMOTE_FILES_DIR/${f.localName}")
-                            for (audio in note.audios) client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
-                        } catch (_: Exception) {}
-                    }
-                    deletedRemote++
-                    SyncLog.log("Deleted remote note $id (tombstone)")
-                }
-            }
-
-            val localIds = updatedLocalNoteMap.keys
-            val remoteIds = remoteNoteMap.keys
-
-            var uploaded = 0
+            // Download notes that are new or newer remotely. Inserts keep the local row id.
             var downloaded = 0
+            for ((uuid, json) in remoteJson) {
+                if (uuid in mergedTombstones) continue
+                val local = dao.getByUuid(uuid)
+                val incoming = runCatching { jsonToNote(json) }.getOrNull() ?: continue
+                if (local != null && !isRemoteNewer(json, local)) continue
 
-            // Notes only on local -> upload (new local notes)
-            for (id in localIds - remoteIds) {
-                val note = updatedLocalNoteMap[id]!!
-                uploadNote(client, note)
-                uploaded++
+                downloadAttachments(client, incoming)
+                dao.insertSafe(context, incoming.copy(id = local?.id ?: 0, uuid = uuid))
+                database.getFolderDao().ensureFolder(incoming.folderId)
+                downloaded++
             }
 
-            // Notes only on remote -> download (new from another device)
-            for (id in remoteIds - localIds) {
-                val json = remoteNoteMap[id]!!
-                try {
-                    val note = jsonToNote(json)
-                    downloadAttachments(client, note)
-                    dao.insertSafe(context, note)
-                    // 方案 B：云端有、本地没有的文件夹，导入时自动补齐
-                    database.getFolderDao().ensureFolder(note.folderId)
-                    downloaded++
-                } catch (_: Exception) {}
-            }
+            // Upload local changes with a precondition, so concurrent writers are detected.
+            var uploaded = 0
+            var conflicts = 0
+            for (local in dao.getAllForSync()) {
+                if (local.uuid in mergedTombstones) continue
+                val remote = remoteJson[local.uuid]
+                if (remote != null && !isLocalNewer(local, remote)) continue
 
-            // Notes on both -> compare timestamps
-            for (id in localIds.intersect(remoteIds)) {
-                val local = updatedLocalNoteMap[id]!!
-                val remoteJson = remoteNoteMap[id]!!
-                val remoteTimestamp = remoteJson.optLong("modifiedTimestamp", 0)
-
-                // 相等 = 两端内容一致，跳过上传。旧实现 `>=` 相等也重传，
-                // 只是被 WebDAV 的低延迟掩盖（一轮几秒），实为每轮全量重传。
-                if (local.modifiedTimestamp > remoteTimestamp) {
-                    // Upload local version, also clean up old filename if title changed
-                    val newFileName = noteFileName(local)
-                    val oldFileNames = remoteNoteIdToFileNames[id] ?: emptyList()
-                    uploadNote(client, local)
-                    for (oldName in oldFileNames) {
-                        if (oldName != newFileName) {
-                            client.delete("$REMOTE_NOTES_DIR/$oldName")
-                            SyncLog.log("Deleted old remote file: $oldName (renamed to $newFileName)")
+                val outcome =
+                    putNote(
+                        client = client,
+                        note = local,
+                        etag = remoteEtags[local.uuid],
+                        createOnly = remote == null,
+                    )
+                when (outcome) {
+                    WebDavClient.ConditionalResult.SUCCESS -> uploaded++
+                    WebDavClient.ConditionalResult.PRECONDITION_FAILED -> {
+                        // Lost a race: preserve the other writer's content as a conflict copy.
+                        val fresh =
+                            client
+                                .download("$REMOTE_NOTES_DIR/${noteFileName(local)}")
+                                .getOrNull()
+                                ?.let {
+                                    runCatching { JSONObject(String(it, Charsets.UTF_8)) }
+                                        .getOrNull()
+                                }
+                        if (fresh != null) {
+                            val remoteNote = jsonToNote(fresh)
+                            downloadAttachments(client, remoteNote)
+                            dao.insertSafe(
+                                context,
+                                remoteNote.copy(
+                                    id = 0,
+                                    uuid = newNoteUuid(),
+                                    title =
+                                        if (remoteNote.title.isBlank()) "Conflict"
+                                        else "${remoteNote.title} (conflict)",
+                                    modifiedTimestamp = System.currentTimeMillis(),
+                                ),
+                            )
+                            conflicts++
                         }
                     }
-                    uploaded++
-                } else {
-                    try {
-                        val note = jsonToNote(remoteJson)
-                        downloadAttachments(client, note)
-                        dao.insertSafe(context, note)
-                        // 方案 B：云端有、本地没有的文件夹，导入时自动补齐
-                        database.getFolderDao().ensureFolder(note.folderId)
-                        downloaded++
-                    } catch (_: Exception) {}
+                    WebDavClient.ConditionalResult.ERROR -> {
+                        SyncLog.log("Upload failed for ${local.uuid}")
+                    }
                 }
             }
 
-            // 重新读取本地笔记（此时远程笔记已下载/合并进本地库），
-            // 用最新状态判断孤儿附件，避免用过时的"空/子集"列表误删服务器附件。
-            cleanupOrphanedAttachments(client, dao.getAllNotesIncludingDeleted())
+            // Orphan cleanup is destructive; only run on a complete remote snapshot.
+            if (snapshotComplete) {
+                cleanupOrphanedAttachments(client, dao.getAllNotesIncludingDeleted())
+            }
             syncLabels(client)
 
-            // Clean up tombstones: remove IDs that no longer exist on either side
-            val currentNoteIds = localIds + remoteIds
-            mergedTombstones.retainAll { it !in currentNoteIds }
-
-            // Save merged tombstones locally and upload sync_meta
-            preferences.webdavDeletedNoteIds.save(mergedTombstones.map { it.toString() }.toSet())
-            uploadSyncMeta(client, currentNoteIds, mergedTombstones.toSet())
+            // Push pending deletions, then publish the tombstone set.
+            for (tombstone in tombstoneDao.getPending()) {
+                if (tombstone.protectedContent && !SecuritySession.appUnlocked) {
+                    SyncLog.log("Deferring protected remote deletion for ${tombstone.uuid}")
+                    continue
+                }
+                client.delete("$REMOTE_NOTES_DIR/${tombstone.uuid}.json")
+                tombstoneDao.markRemoteApplied(tombstone.uuid)
+            }
+            uploadSyncMeta(client, tombstoneDao.getAll())
 
             preferences.webdavLastSyncTime.save(System.currentTimeMillis())
-            SyncLog.log("Sync complete: $uploaded uploaded, $downloaded downloaded, $deletedLocal deleted locally, $deletedRemote deleted remotely, ${mergedTombstones.size} tombstones")
-            SyncResult.Success("Sync complete: $uploaded up, $downloaded down, $deletedLocal local del, $deletedRemote remote del")
+            SyncLog.log(
+                "Sync complete: $uploaded uploaded, $downloaded downloaded, " +
+                    "$deletedLocal deleted locally, $conflicts conflicts"
+            )
+            SyncResult.Success(
+                "Sync complete: $uploaded up, $downloaded down, $deletedLocal local del, $conflicts conflicts"
+            )
         } catch (e: Exception) {
             SyncLog.log("Sync error: ${e.message}")
             SyncResult.Error(e.message ?: "Sync failed")
         }
+    }
+
+    private fun isLocalNewer(local: BaseNote, remote: JSONObject): Boolean =
+        SyncOrdering.isLocalNewer(
+            localVersion = local.version,
+            localModified = local.modifiedTimestamp,
+            remoteVersion = remote.optLong("version", -1),
+            remoteModified = remote.optLong("modifiedTimestamp", 0),
+        )
+
+    private fun isRemoteNewer(remote: JSONObject, local: BaseNote): Boolean =
+        SyncOrdering.isRemoteNewer(
+            localVersion = local.version,
+            localModified = local.modifiedTimestamp,
+            remoteVersion = remote.optLong("version", -1),
+            remoteModified = remote.optLong("modifiedTimestamp", 0),
+        )
+
+    private fun putNote(
+        client: WebDavClient,
+        note: BaseNote,
+        etag: String?,
+        createOnly: Boolean,
+    ): WebDavClient.ConditionalResult {
+        val result =
+            client.uploadConditional(
+                path = "$REMOTE_NOTES_DIR/${noteFileName(note)}",
+                data = noteToJson(note).toByteArray(Charsets.UTF_8),
+                ifMatch = etag,
+                ifNoneMatchStar = createOnly,
+            )
+        if (result == WebDavClient.ConditionalResult.SUCCESS) {
+            uploadAttachments(client, note)
+        }
+        return result
     }
 
     private suspend fun ensureRemoteDirs(client: WebDavClient) {
@@ -521,7 +516,12 @@ class WebDavSyncService(private val context: ContextWrapper) {
 
     private fun noteToJson(note: BaseNote): String {
         val json = JSONObject()
-        json.put("id", note.id)
+        json.put("schema", 2)
+        json.put("uuid", note.uuid)
+        json.put("version", note.version)
+        json.put("contentFormat", note.contentFormat.name)
+        json.put("protection", note.protection.name)
+        note.payload?.let { json.put("payload", JSONObject(it.toJson())) }
         json.put("type", note.type.name)
         json.put("folder", note.folder.name)
         json.put("color", note.color)
@@ -544,11 +544,21 @@ class WebDavSyncService(private val context: ContextWrapper) {
     }
 
     private fun jsonToNote(json: JSONObject): BaseNote {
+        val locked = json.optBoolean("locked", false)
+        val protection =
+            json.optString("protection", "")
+                .takeIf { it.isNotEmpty() }
+                ?.let { runCatching { NoteProtection.valueOf(it) }.getOrNull() }
+                ?: if (locked) NoteProtection.LEGACY_LOCK else NoteProtection.NONE
+        val payload =
+            json.optJSONObject("payload")?.let {
+                runCatching { ProtectedPayload.fromJson(it.toString()) }.getOrNull()
+            }
         return BaseNote(
-            id = json.getLong("id"),
+            id = 0,
             type = cool.hin.memox.data.model.Type.valueOfOrDefault(json.getString("type")),
             folder = Folder.valueOf(json.getString("folder")),
-            color = json.getString("color"),
+            color = json.optString("color", BaseNote.COLOR_DEFAULT),
             title = json.optString("title", ""),
             pinned = json.optBoolean("pinned", false),
             timestamp = json.getLong("timestamp"),
@@ -562,8 +572,15 @@ class WebDavSyncService(private val context: ContextWrapper) {
             audios = Converters.jsonToAudios(JSONArray(json.optString("audios", "[]"))),
             reminders = Converters.jsonToReminders(JSONArray(json.optString("reminders", "[]"))),
             isPinnedToStatus = json.optBoolean("isPinnedToStatus", false),
-            locked = json.optBoolean("locked", false),
+            locked = locked,
             folderId = json.optString("folderId", ""),
+            uuid = json.optString("uuid", ""),
+            version = json.optLong("version", 0),
+            contentFormat =
+                runCatching { ContentFormat.valueOf(json.optString("contentFormat", "RICH_TEXT")) }
+                    .getOrDefault(ContentFormat.RICH_TEXT),
+            protection = protection,
+            payload = payload,
         )
     }
 
@@ -603,22 +620,24 @@ class WebDavSyncService(private val context: ContextWrapper) {
         subfolder: String,
         name: String,
     ) {
-        val file = getLocalAttachmentFile(subfolder, name)
+        val encrypted = NoteCrypto.encryptedAttachmentFile(context, subfolder, name)
+        val remoteName = if (encrypted.exists()) "$name.enc" else name
+        val file = if (encrypted.exists()) encrypted else getLocalAttachmentFile(subfolder, name)
         if (file == null || !file.exists()) {
             Log.d(TAG, "uploadAttachment: local file missing, skip $subfolder/$name")
             return
         }
         val localSize = file.length()
         val known = remoteAttachmentIndex?.get(remoteDir)
-        if (known != null && known[name] == localSize) return
+        if (known != null && known[remoteName] == localSize) return
 
-        val result = client.upload("$remoteDir/$name", file.readBytes())
+        val result = client.upload("$remoteDir/$remoteName", file.readBytes())
         if (result.isSuccess) {
-            known?.put(name, localSize)
+            known?.put(remoteName, localSize)
         } else {
             Log.w(
                 TAG,
-                "uploadAttachment: failed $remoteDir/$name: ${result.exceptionOrNull()?.message}",
+                "uploadAttachment: failed $remoteDir/$remoteName: ${result.exceptionOrNull()?.message}",
             )
         }
     }
@@ -643,8 +662,19 @@ class WebDavSyncService(private val context: ContextWrapper) {
         subfolder: String,
         name: String,
     ) {
-        val localFile = ensureLocalAttachmentFile(subfolder, name) ?: return
-        val remoteSize = remoteAttachmentIndex?.get(remoteDir)?.get(name)
+        val remoteName =
+            if (remoteAttachmentIndex?.get(remoteDir)?.containsKey("$name.enc") == true) {
+                "$name.enc"
+            } else {
+                name
+            }
+        val localFile =
+            if (remoteName.endsWith(".enc")) {
+                NoteCrypto.encryptedAttachmentFile(context, subfolder, name)
+            } else {
+                ensureLocalAttachmentFile(subfolder, name) ?: return
+            }
+        val remoteSize = remoteAttachmentIndex?.get(remoteDir)?.get(remoteName)
         if (
             localFile.exists() &&
                 localFile.length() > 0 &&
@@ -652,7 +682,7 @@ class WebDavSyncService(private val context: ContextWrapper) {
         ) {
             return
         }
-        client.download("$remoteDir/$name").getOrNull()?.let { bytes ->
+        client.download("$remoteDir/$remoteName").getOrNull()?.let { bytes ->
             localFile.parentFile?.mkdirs()
             localFile.writeBytes(bytes)
         }
@@ -673,6 +703,10 @@ class WebDavSyncService(private val context: ContextWrapper) {
         }
         return File(dir, localName)
     }
+    /** A referenced attachment may exist remotely as plaintext or as an encrypted sibling. */
+    private fun attachmentNames(names: List<String>): Set<String> =
+        names.flatMap { listOf(it, "$it.enc") }.toSet()
+
 
     /**
      * Remove remote attachments that are no longer referenced by any note.
@@ -687,9 +721,9 @@ class WebDavSyncService(private val context: ContextWrapper) {
             return
         }
         try {
-            val referencedImages = allNotes.flatMap { it.images.map { img -> img.localName } }.toSet()
-            val referencedFiles = allNotes.flatMap { it.files.map { f -> f.localName } }.toSet()
-            val referencedAudios = allNotes.flatMap { it.audios.map { a -> a.name } }.toSet()
+            val referencedImages = attachmentNames(allNotes.flatMap { it.images.map { img -> img.localName } })
+            val referencedFiles = attachmentNames(allNotes.flatMap { it.files.map { f -> f.localName } })
+            val referencedAudios = attachmentNames(allNotes.flatMap { it.audios.map { a -> a.name } })
 
             cleanupOrphanedDir(client, REMOTE_IMAGES_DIR, referencedImages)
             cleanupOrphanedDir(client, REMOTE_FILES_DIR, referencedFiles)
@@ -714,40 +748,14 @@ class WebDavSyncService(private val context: ContextWrapper) {
             }
         }
     }
-
-    /** Delete a single note and its attachments from WebDAV, and record tombstone */
+    /** Delete a single note and its attachments from WebDAV, and record a UUID tombstone. */
     suspend fun deleteRemoteNote(note: BaseNote) = withContext(Dispatchers.IO) {
         val client = createClient() ?: return@withContext
         try {
-            // Delete all possible filenames for this note ID
-            val currentFileName = noteFileName(note)
-            val idOnlyFileName = "${note.id}.json"
-            client.delete("$REMOTE_NOTES_DIR/$currentFileName")
-            if (currentFileName != idOnlyFileName) {
-                client.delete("$REMOTE_NOTES_DIR/$idOnlyFileName")
-            }
-            // Also try to find and delete any other files with this note ID
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-            for (file in remoteFiles) {
-                if (!file.isDirectory && file.name.endsWith(".json")) {
-                    if (extractNoteId(file.name) == note.id && file.name != currentFileName && file.name != idOnlyFileName) {
-                        client.delete("$REMOTE_NOTES_DIR/${file.name}")
-                    }
-                }
-            }
-            // Delete remote attachments
-            for (img in note.images) {
-                client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
-            }
-            for (f in note.files) {
-                client.delete("$REMOTE_FILES_DIR/${f.localName}")
-            }
-            for (audio in note.audios) {
-                client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
-            }
-            // Record tombstone
-            addTombstone(client, note.id)
-            SyncLog.log("Deleted remote note: $currentFileName (and any duplicate files)")
+            client.delete("$REMOTE_NOTES_DIR/${noteFileName(note)}")
+            deleteRemoteAttachments(client, note)
+            addTombstone(note)
+            SyncLog.log("Deleted remote note: ${note.uuid}")
         } catch (e: Exception) {
             Log.w(TAG, "deleteRemoteNote failed: ${e.message}")
         }
@@ -757,91 +765,74 @@ class WebDavSyncService(private val context: ContextWrapper) {
     suspend fun deleteRemoteNotes(notes: Collection<BaseNote>) = withContext(Dispatchers.IO) {
         val client = createClient() ?: return@withContext
         try {
-            // Get all remote files to find duplicates
-            val remoteFiles = client.listFiles(REMOTE_NOTES_DIR).getOrNull() ?: emptyList()
-
             for (note in notes) {
-                val currentFileName = noteFileName(note)
-                val idOnlyFileName = "${note.id}.json"
-                client.delete("$REMOTE_NOTES_DIR/$currentFileName")
-                if (currentFileName != idOnlyFileName) {
-                    client.delete("$REMOTE_NOTES_DIR/$idOnlyFileName")
-                }
-                // Delete any other files with this note ID
-                for (file in remoteFiles) {
-                    if (!file.isDirectory && file.name.endsWith(".json")) {
-                        if (extractNoteId(file.name) == note.id && file.name != currentFileName && file.name != idOnlyFileName) {
-                            client.delete("$REMOTE_NOTES_DIR/${file.name}")
-                        }
-                    }
-                }
-                for (img in note.images) {
-                    client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
-                }
-                for (f in note.files) {
-                    client.delete("$REMOTE_FILES_DIR/${f.localName}")
-                }
-                for (audio in note.audios) {
-                    client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
-                }
+                client.delete("$REMOTE_NOTES_DIR/${noteFileName(note)}")
+                deleteRemoteAttachments(client, note)
+                addTombstone(note)
             }
-            // Record tombstones
-            addTombstones(client, notes.map { it.id }.toSet())
             SyncLog.log("Deleted ${notes.size} remote notes")
         } catch (e: Exception) {
             Log.w(TAG, "deleteRemoteNotes failed: ${e.message}")
         }
     }
 
-    /** Add a note ID to the tombstone list and upload updated sync_meta */
-    private fun addTombstone(client: WebDavClient, noteId: Long) {
-        addTombstones(client, setOf(noteId))
+    private fun deleteRemoteAttachments(client: WebDavClient, note: BaseNote) {
+        for (img in note.images) {
+            client.delete("$REMOTE_IMAGES_DIR/${img.localName}")
+            client.delete("$REMOTE_IMAGES_DIR/${img.localName}.enc")
+        }
+        for (f in note.files) {
+            client.delete("$REMOTE_FILES_DIR/${f.localName}")
+            client.delete("$REMOTE_FILES_DIR/${f.localName}.enc")
+        }
+        for (audio in note.audios) {
+            client.delete("$REMOTE_AUDIOS_DIR/${audio.name}")
+            client.delete("$REMOTE_AUDIOS_DIR/${audio.name}.enc")
+        }
     }
 
-    /** Add note IDs to the tombstone list and upload updated sync_meta */
-    private fun addTombstones(client: WebDavClient, noteIds: Set<Long>) {
-        val currentTombstones = preferences.webdavDeletedNoteIds.value
-            .mapNotNull { it.toLongOrNull() }
-            .toMutableSet()
-        currentTombstones.addAll(noteIds)
-        preferences.webdavDeletedNoteIds.save(currentTombstones.map { it.toString() }.toSet())
-
-        // Upload updated sync_meta with tombstones
-        try {
-            val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
-            val dao = database.getBaseNoteDao()
-            val localIds = dao.getAllIds().toSet()
-            uploadSyncMeta(client, localIds, currentTombstones)
-        } catch (_: Exception) {}
+    /** Record a tombstone locally. The sync loop pushes it with a conditional delete. */
+    private suspend fun addTombstone(note: BaseNote) {
+        if (note.uuid.isBlank()) return
+        val database = MemoXDatabase.getDatabase(context, observePreferences = false).value
+        database
+            .getTombstoneDao()
+            .upsert(
+                NoteTombstone(
+                    uuid = note.uuid,
+                    deletedAt = System.currentTimeMillis(),
+                    version = note.version,
+                    protectedContent = note.protection.isEncrypted,
+                )
+            )
     }
 
-    /** Upload sync metadata including synced note IDs and tombstones */
-    private fun uploadSyncMeta(client: WebDavClient, noteIds: Set<Long>, tombstones: Set<Long>) {
+    /** Upload sync metadata. Deletions are UUIDs; local row ids never leave this device. */
+    private fun uploadSyncMeta(client: WebDavClient, tombstones: List<NoteTombstone>) {
         try {
-            val json = JSONObject().apply {
-                put("lastSyncTime", System.currentTimeMillis())
-                put("noteCount", noteIds.size)
-                put("appVersion", "1.0.5")
-                val idsArray = JSONArray()
-                for (id in noteIds.sorted()) {
-                    idsArray.put(id)
+            val json =
+                JSONObject().apply {
+                    put("schema", 2)
+                    put("lastSyncTime", System.currentTimeMillis())
+                    val deletedArray = JSONArray()
+                    for (tombstone in tombstones) {
+                        deletedArray.put(
+                            JSONObject()
+                                .put("uuid", tombstone.uuid)
+                                .put("deletedAt", tombstone.deletedAt)
+                                .put("version", tombstone.version)
+                        )
+                    }
+                    put("tombstones", deletedArray)
                 }
-                put("syncedNoteIds", idsArray)
-                val deletedArray = JSONArray()
-                for (id in tombstones.sorted()) {
-                    deletedArray.put(id)
-                }
-                put("deletedNoteIds", deletedArray)
-            }
             client.upload(REMOTE_SYNC_META, json.toString().toByteArray(Charsets.UTF_8))
         } catch (_: Exception) {}
     }
 
     /** Data class for sync metadata */
-    private data class SyncMeta(
-        val syncedNoteIds: Set<Long>,
-        val deletedNoteIds: Set<Long>,
-    )
+    private data class SyncTombstone(val uuid: String, val deletedAt: Long)
+
+    private data class SyncMeta(val tombstones: List<SyncTombstone>)
 
     /** Download sync metadata */
     private fun downloadSyncMeta(client: WebDavClient): SyncMeta? {
@@ -849,24 +840,20 @@ class WebDavSyncService(private val context: ContextWrapper) {
             val result = client.download(REMOTE_SYNC_META)
             val bytes = result.getOrNull() ?: return null
             val json = JSONObject(String(bytes, Charsets.UTF_8))
+            if (json.optInt("schema", 0) < 2) return SyncMeta(emptyList())
 
-            val syncedIds = mutableSetOf<Long>()
-            val syncedArray = json.optJSONArray("syncedNoteIds")
-            if (syncedArray != null) {
-                for (i in 0 until syncedArray.length()) {
-                    syncedIds.add(syncedArray.getLong(i))
+            val tombstones = mutableListOf<SyncTombstone>()
+            val array = json.optJSONArray("tombstones")
+            if (array != null) {
+                for (i in 0 until array.length()) {
+                    val obj = array.optJSONObject(i) ?: continue
+                    val uuid = obj.optString("uuid", "")
+                    if (uuid.isNotEmpty()) {
+                        tombstones.add(SyncTombstone(uuid, obj.optLong("deletedAt", 0)))
+                    }
                 }
             }
-
-            val deletedIds = mutableSetOf<Long>()
-            val deletedArray = json.optJSONArray("deletedNoteIds")
-            if (deletedArray != null) {
-                for (i in 0 until deletedArray.length()) {
-                    deletedIds.add(deletedArray.getLong(i))
-                }
-            }
-
-            SyncMeta(syncedIds, deletedIds)
+            SyncMeta(tombstones)
         } catch (_: Exception) {
             null
         }
