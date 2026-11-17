@@ -131,6 +131,15 @@ fun ContextWrapper.resolveAttachmentFile(subfolder: String, localName: String): 
     if (inCurrent != null && inCurrent.exists()) return inCurrent
     val inAlt = alt?.let { File(it, localName) }
     if (inAlt != null && inAlt.exists()) return inAlt
+    // Encrypted notes decrypt their attachments into a per-note session cache. The UI resolves
+    // attachments by name only, so this transparent fallback keeps every viewer working.
+    val cached =
+        File(cacheDir, "note-protected-cache")
+            .listFiles()
+            ?.asSequence()
+            ?.map { File(File(it, subfolder), localName) }
+            ?.firstOrNull { it.exists() }
+    if (cached != null) return cached
     return inCurrent ?: inAlt
 }
 

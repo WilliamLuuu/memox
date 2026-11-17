@@ -332,13 +332,19 @@ private fun backupAttachmentFile(
     folder: String,
     name: String,
 ): Boolean {
-    val file = context.resolveAttachmentFile(folder, name)
-    return if (file != null && file.exists()) {
-        zipFile.addFile(file, zipParameters.copy("$folder/$name"))
-        true
-    } else {
-        false
+    // A protected attachment only exists as `<name>.enc`; export that exact sibling so a restore
+    // keeps the note decryptable. Never export the transient decrypted cache.
+    val encrypted =
+        cool.hin.memox.data.security.NoteCrypto.encryptedAttachmentFile(context, folder, name)
+    if (encrypted.exists()) {
+        zipFile.addFile(encrypted, zipParameters.copy("$folder/$name.enc"))
+        return true
     }
+    val file = context.resolveAttachmentFile(folder, name)
+    if (file == null || !file.exists()) return false
+    if (file.absolutePath.contains("note-protected-cache")) return false
+    zipFile.addFile(file, zipParameters.copy("$folder/$name"))
+    return true
 }
 
 private fun ZipParameters.copy(fileNameInZip: String? = this.fileNameInZip): ZipParameters {

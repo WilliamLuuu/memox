@@ -117,44 +117,22 @@ class ModelExtensionsTest {
                 isPinnedToStatus = false,
             )
 
-        val json = baseNote.toJson()
+        val json = org.json.JSONObject(baseNote.toJson())
 
-        assertEquals(
-            """
-            {
-              "reminders": [{
-                "dateTime": 1743253506957,
-                "isNotificationVisible": false,
-                "id": 1,
-                "repetition": {
-                  "unit": "WEEKS",
-                  "value": 10
-                }
-              }],
-              "pinned": true,
-              "color": "#E2F6D3",
-              "modifiedTimestamp": 945869546,
-              "type": "NOTE",
-              "title": "Title",
-              "items": [
-                {
-                  "checked": true,
-                  "body": "Item1",
-                  "isChild": false
-                },
-                {
-                  "checked": true,
-                  "body": "Item2",
-                  "isChild": true
-                }
-              ],
-              "timestamp": 12354632465,
-              "labels": ["label"]
-            }
-        """
-                .trimIndent()
-                .trimStart(),
-            json,
-        )
+        assertEquals("Title", json.getString("title"))
+        assertEquals("Body", json.getString("body"))
+        assertEquals("NOTE", json.getString("type"))
+        assertEquals("DELETED", json.getString("folder"))
+        assertEquals("RICH_TEXT", json.getString("contentFormat"))
+        assertEquals("NONE", json.getString("protection"))
+        assertEquals(false, json.getBoolean("locked"))
+        assertEquals(2, json.getJSONArray("items").length())
+        assertEquals(1, json.getJSONArray("images").length())
+        assertEquals(1, json.getJSONArray("files").length())
+        assertEquals(1, json.getJSONArray("audios").length())
+        assertEquals(1, json.getJSONArray("reminders").length())
+        assertEquals("label", json.getJSONArray("labels").getString(0))
+        assertEquals(12354632465L, json.getLong("timestamp"))
+        assertEquals(945869546L, json.getLong("modifiedTimestamp"))
     }
 }

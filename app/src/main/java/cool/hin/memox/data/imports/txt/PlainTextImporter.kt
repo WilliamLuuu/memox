@@ -27,10 +27,10 @@ class PlainTextImporter : ExternalImporter {
         progress: MutableLiveData<ImportProgress>?,
     ): Pair<List<BaseNote>, File?> {
         val notes = mutableListOf<BaseNote>()
-        fun readTxtFiles(file: DocumentFile) {
+        fun readTxtFiles(file: DocumentFile, parent: DocumentFile? = null) {
             when {
                 file.isDirectory -> {
-                    file.listFiles().forEach { readTxtFiles(it) }
+                    file.listFiles().forEach { readTxtFiles(it, file) }
                 }
 
                 file.isFile -> {
@@ -52,6 +52,74 @@ class PlainTextImporter : ExternalImporter {
                     }
                     val timestamp = System.currentTimeMillis()
 
+                    if (file.isMarkdownFile() && listItems.isEmpty() && content.isNotEmpty()) {
+                        // Markdown stays Markdown: never convert the source into rich-text spans,
+                        // otherwise a round trip through memoX cannot preserve the original file.
+                        val images = mutableListOf<cool.hin.memox.data.model.FileAttachment>()
+                        val files = mutableListOf<cool.hin.memox.data.model.FileAttachment>()
+                        val linkPattern = Regex("""!?\[[^\]]*]\(([^)]+)\)""")
+                        var rewritten = content
+                        linkPattern.findAll(content).forEach { match ->
+                            val rawTarget = match.groupValues[1].trim()
+                            val target =
+                                rawTarget.substringBefore('#').substringBefore('?').trim()
+                            if (target.isEmpty() ||
+                                target.startsWith("http://") ||
+                                target.startsWith("https://") ||
+                                target.startsWith("data:") ||
+                                target.startsWith("/")
+                            ) {
+                                return@forEach
+                            }
+                            val document =
+                                parent?.let { resolveRelativeDocument(it, target) }
+                                    ?: return@forEach
+                            val extension = target.substringAfterLast('.', "bin")
+                            val localName = "${java.util.UUID.randomUUID()}.$extension"
+                            try {
+                                app.contentResolver.openInputStream(document.uri)?.use { input ->
+                                    File(destination, localName).outputStream().use { output ->
+                                        input.copyTo(output)
+                                    }
+                                } ?: return@forEach
+                            } catch (_: Exception) {
+                                return@forEach
+                            }
+                            val mime = document.type ?: "application/octet-stream"
+                            val attachment =
+                                cool.hin.memox.data.model.FileAttachment(
+                                    localName = localName,
+                                    originalName = target.substringAfterLast('/'),
+                                    mimeType = mime,
+                                )
+                            if (mime.startsWith("image/")) images.add(attachment)
+                            else files.add(attachment)
+                            rewritten = rewritten.replace(rawTarget, localName)
+                        }
+                        notes.add(
+                            BaseNote(
+                                id = 0L,
+                                type = Type.NOTE,
+                                folder = Folder.NOTES,
+                                color = BaseNote.COLOR_DEFAULT,
+                                title = fileNameWithoutExtension,
+                                pinned = false,
+                                timestamp = timestamp,
+                                modifiedTimestamp = timestamp,
+                                labels = emptyList(),
+                                body = rewritten,
+                                spans = emptyList(),
+                                items = emptyList(),
+                                images = images,
+                                files = files,
+                                audios = emptyList(),
+                                reminders = emptyList(),
+                                isPinnedToStatus = false,
+                                contentFormat = cool.hin.memox.data.model.ContentFormat.MARKDOWN,
+                            )
+                        )
+                        return
+                    }
                     val (body, spans) =
                         if (file.isMarkdownFile() && listItems.isEmpty()) {
                             // Parse Markdown into body + spans, ignoring unsupported formatting
@@ -111,6 +179,17 @@ class PlainTextImporter : ExternalImporter {
             (name
                 ?.substringAfterLast('.', "")
                 ?.equals(ExportMimeType.MD.fileExtension, ignoreCase = true) == true)
+    }
+
+    /** Resolve a relative Markdown link against the note's folder. Parent traversal is refused. */
+    private fun resolveRelativeDocument(base: DocumentFile, path: String): DocumentFile? {
+        var current: DocumentFile = base
+        for (part in path.split('/')) {
+            if (part.isEmpty() || part == ".") continue
+            if (part == "..") return null
+            current = current.findFile(part) ?: return null
+        }
+        return current.takeIf { it.isFile }
     }
 
     companion object {

@@ -122,13 +122,25 @@ fun BaseNote.toJson(): String {
     val jsonObject =
         JSONObject()
             .put("type", type.name)
+            .put("folder", folder.name)
+            .put("folderId", folderId)
             .put("color", color)
             .put("title", title)
             .put("pinned", pinned)
+            .put("isPinnedToStatus", isPinnedToStatus)
             .put("timestamp", timestamp)
             .put("modifiedTimestamp", modifiedTimestamp)
             .put("labels", JSONArray(labels))
+            .put("locked", locked)
+            .put("uuid", uuid)
+            .put("version", version)
+            .put("contentFormat", contentFormat.name)
+            .put("protection", protection.name)
+            .put("images", JSONArray(Converters.filesToJson(images)))
+            .put("files", JSONArray(Converters.filesToJson(files)))
+            .put("audios", JSONArray(Converters.audiosToJson(audios)))
 
+    payload?.let { jsonObject.put("payload", JSONObject(it.toJson())) }
     jsonObject.put("body", body)
     jsonObject.put("spans", Converters.spansToJSONArray(spans))
     if (items.isNotEmpty()) {
@@ -160,6 +172,20 @@ fun String.toBaseNote(): BaseNote {
     val audios = Converters.jsonToAudios(jsonObject.getArrayOrEmpty("audios"))
     val reminders = Converters.jsonToReminders(jsonObject.getArrayOrEmpty("reminders"))
     val locked = jsonObject.getBooleanOrDefault("locked", false)
+    val protection =
+        jsonObject
+            .getStringOrDefault("protection", "")
+            .takeIf { it.isNotEmpty() }
+            ?.let { runCatching { NoteProtection.valueOf(it) }.getOrNull() }
+            ?: if (locked) NoteProtection.LEGACY_LOCK else NoteProtection.NONE
+    val contentFormat =
+        jsonObject
+            .getStringOrDefault("contentFormat", ContentFormat.RICH_TEXT.name)
+            .let { runCatching { ContentFormat.valueOf(it) }.getOrDefault(ContentFormat.RICH_TEXT) }
+    val payload =
+        jsonObject.optJSONObject("payload")?.let {
+            runCatching { ProtectedPayload.fromJson(it.toString()) }.getOrNull()
+        }
     return BaseNote(
         id,
         type,
@@ -180,6 +206,11 @@ fun String.toBaseNote(): BaseNote {
         pinnedToStatusBar,
         locked,
         folderId = jsonObject.getStringOrDefault("folderId", ""),
+        uuid = jsonObject.getStringOrDefault("uuid", ""),
+        version = jsonObject.getLongOrDefault("version", 0),
+        contentFormat = contentFormat,
+        protection = protection,
+        payload = payload,
     )
 }
 

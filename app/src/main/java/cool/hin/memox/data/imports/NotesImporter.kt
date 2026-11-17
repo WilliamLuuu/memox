@@ -11,6 +11,7 @@ import cool.hin.memox.data.dao.BaseNoteDao.Companion.MAX_BODY_CHAR_LENGTH
 import cool.hin.memox.data.imports.evernote.EvernoteImporter
 import cool.hin.memox.data.imports.google.GoogleKeepImporter
 import cool.hin.memox.data.imports.quillpad.QuillpadImporter
+import cool.hin.memox.data.imports.joplin.JoplinJexImporter
 import cool.hin.memox.data.imports.txt.JsonImporter
 import cool.hin.memox.data.imports.txt.PlainTextImporter
 import cool.hin.memox.data.model.Audio
@@ -49,6 +50,7 @@ class NotesImporter(private val app: Application, private val database: MemoXDat
                         ImportSource.EVERNOTE -> EvernoteImporter()
                         ImportSource.PLAIN_TEXT -> PlainTextImporter()
                         ImportSource.JSON -> JsonImporter()
+                        ImportSource.JOPLIN -> JoplinJexImporter()
                     }.import(app, uri, tempDir, progress)
                 } catch (e: Exception) {
                     Log.e(TAG, "import: failed", e)
@@ -224,6 +226,13 @@ enum class ImportSource(
         R.string.json_files_help,
         null,
         R.drawable.file_json,
+    ),
+    JOPLIN(
+        R.string.joplin,
+        MIME_TYPE_ZIP,
+        R.string.joplin_help,
+        "https://joplinapp.org/help/apps/import_export/",
+        R.drawable.archive,
     );
 
     override fun getTextId(): Int {

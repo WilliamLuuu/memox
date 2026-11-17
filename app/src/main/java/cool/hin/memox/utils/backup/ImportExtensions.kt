@@ -22,6 +22,9 @@ import cool.hin.memox.data.model.Audio
 import cool.hin.memox.data.model.BaseNote
 import cool.hin.memox.data.model.BaseNote.Companion
 import cool.hin.memox.data.model.Converters
+import cool.hin.memox.data.model.ContentFormat
+import cool.hin.memox.data.model.NoteProtection
+import cool.hin.memox.data.model.ProtectedPayload
 import cool.hin.memox.data.model.FileAttachment
 import cool.hin.memox.data.model.Folder
 import cool.hin.memox.data.model.Label
@@ -202,12 +205,20 @@ suspend fun ContextWrapper.importZip(
                     )
                     baseNote.audios.forEach { audio ->
                         try {
-                            val audioFilePath = "$SUBFOLDER_AUDIOS/${audio.name}"
-                            val entry = zipFile.getFileHeader(audioFilePath)
-                            if (entry != null) {
-                                val name = "${UUID.randomUUID()}.m4a"
-                                zipFile.extractFile(audioFilePath, audioRoot!!.path, name)
-                                audio.name = name
+                            val encryptedPath = "$SUBFOLDER_AUDIOS/${audio.name}.enc"
+                            if (zipFile.getFileHeader(encryptedPath) != null) {
+                                zipFile.extractFile(
+                                    encryptedPath,
+                                    audioRoot!!.path,
+                                    "${audio.name}.enc",
+                                )
+                            } else {
+                                val audioFilePath = "$SUBFOLDER_AUDIOS/${audio.name}"
+                                if (zipFile.getFileHeader(audioFilePath) != null) {
+                                    val name = "${UUID.randomUUID()}.m4a"
+                                    zipFile.extractFile(audioFilePath, audioRoot!!.path, name)
+                                    audio.name = name
+                                }
                             }
                         } catch (exception: Exception) {
                             log(TAG, throwable = exception)
@@ -262,12 +273,23 @@ private fun ContextWrapper.importFiles(
 ) {
     files.forEach { file ->
         try {
-            val entry = zipFile.getFileHeader("$subFolder/${file.localName}")
-            if (entry != null) {
-                val extension = file.localName.substringAfterLast(".")
-                val name = "${UUID.randomUUID()}.$extension"
-                zipFile.extractFile("$subFolder/${file.localName}", localFolder!!.path, name)
-                file.localName = name
+            val encryptedEntry = zipFile.getFileHeader("$subFolder/${file.localName}.enc")
+            if (encryptedEntry != null) {
+                // Keep the original name: the encryption envelope references it and the note
+                // must stay decryptable after a restore.
+                zipFile.extractFile(
+                    "$subFolder/${file.localName}.enc",
+                    localFolder!!.path,
+                    "${file.localName}.enc",
+                )
+            } else {
+                val entry = zipFile.getFileHeader("$subFolder/${file.localName}")
+                if (entry != null) {
+                    val extension = file.localName.substringAfterLast(".")
+                    val name = "${UUID.randomUUID()}.$extension"
+                    zipFile.extractFile("$subFolder/${file.localName}", localFolder!!.path, name)
+                    file.localName = name
+                }
             }
         } catch (e: Exception) {
             log(TAG, throwable = e)
@@ -379,6 +401,42 @@ private fun Cursor.toBaseNote(sourceDb: SQLiteDatabase): BaseNote {
             } else emptyList()
         }
 
+    val lockedIndex = getColumnIndex("locked")
+    val locked = lockedIndex != -1 && getInt(lockedIndex) != 0
+    val folderIdIndex = getColumnIndex("folderId")
+    val folderId = if (folderIdIndex != -1) getString(folderIdIndex) ?: "" else ""
+    val uuidIndex = getColumnIndex("uuid")
+    val uuid = if (uuidIndex != -1) getString(uuidIndex) ?: "" else ""
+    val versionIndex = getColumnIndex("version")
+    val version = if (versionIndex != -1) getLong(versionIndex) else 0L
+    val contentFormatIndex = getColumnIndex("contentFormat")
+    val contentFormat =
+        if (contentFormatIndex != -1) {
+            runCatching { ContentFormat.valueOf(getString(contentFormatIndex)) }
+                .getOrDefault(ContentFormat.RICH_TEXT)
+        } else {
+            ContentFormat.RICH_TEXT
+        }
+    val protectionIndex = getColumnIndex("protection")
+    val protection =
+        if (protectionIndex != -1) {
+            runCatching { NoteProtection.valueOf(getString(protectionIndex)) }
+                .getOrDefault(if (locked) NoteProtection.LEGACY_LOCK else NoteProtection.NONE)
+        } else if (locked) {
+            NoteProtection.LEGACY_LOCK
+        } else {
+            NoteProtection.NONE
+        }
+    val payloadIndex = getColumnIndex("payload")
+    val payload =
+        if (payloadIndex != -1) {
+            getString(payloadIndex)?.takeIf { it.isNotBlank() }?.let {
+                runCatching { ProtectedPayload.fromJson(it) }.getOrNull()
+            }
+        } else {
+            null
+        }
+
     return BaseNote(
         0,
         type,
@@ -397,6 +455,13 @@ private fun Cursor.toBaseNote(sourceDb: SQLiteDatabase): BaseNote {
         audios,
         reminders,
         pinnedToStatusBar,
+        locked = locked,
+        folderId = folderId,
+        uuid = uuid,
+        version = version,
+        contentFormat = contentFormat,
+        protection = protection,
+        payload = payload,
     )
 }
 

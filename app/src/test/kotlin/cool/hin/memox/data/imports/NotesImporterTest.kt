@@ -139,6 +139,7 @@ class NotesImporterTest {
             ImportSource.PLAIN_TEXT -> File(tempDir, "text.txt")
             ImportSource.JSON -> File(tempDir, "text.json")
             ImportSource.QUILLPAD -> File(tempDir, "quillpad_backup.zip")
+            ImportSource.JOPLIN -> File(tempDir, "notes.jex")
         }
     }
 
