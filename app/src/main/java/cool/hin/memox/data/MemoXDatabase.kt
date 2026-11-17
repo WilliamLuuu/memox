@@ -17,11 +17,13 @@ import cool.hin.memox.data.dao.BaseNoteDao
 import cool.hin.memox.data.dao.CommonDao
 import cool.hin.memox.data.dao.FolderDao
 import cool.hin.memox.data.dao.LabelDao
+import cool.hin.memox.data.dao.TombstoneDao
 import cool.hin.memox.data.model.BaseNote
 import cool.hin.memox.data.model.Color
 import cool.hin.memox.data.model.Converters
 import cool.hin.memox.data.model.Label
 import cool.hin.memox.data.model.NoteFolder
+import cool.hin.memox.data.model.NoteTombstone
 import cool.hin.memox.data.model.toColorString
 import cool.hin.memox.presentation.view.misc.NotNullLiveData
 import cool.hin.memox.presentation.viewmodel.preference.BiometricLock
@@ -34,7 +36,10 @@ import java.io.File
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 
 @TypeConverters(Converters::class)
-@Database(entities = [BaseNote::class, Label::class, NoteFolder::class], version = 17)
+@Database(
+    entities = [BaseNote::class, Label::class, NoteFolder::class, NoteTombstone::class],
+    version = 18,
+)
 abstract class MemoXDatabase : RoomDatabase() {
 
     abstract fun getLabelDao(): LabelDao
@@ -44,6 +49,8 @@ abstract class MemoXDatabase : RoomDatabase() {
     abstract fun getCommonDao(): CommonDao
 
     abstract fun getBaseNoteDao(): BaseNoteDao
+
+    abstract fun getTombstoneDao(): TombstoneDao
 
     fun checkpoint() {
         getBaseNoteDao().query(SimpleSQLiteQuery("pragma wal_checkpoint(FULL)"))
@@ -172,6 +179,7 @@ abstract class MemoXDatabase : RoomDatabase() {
                         Migration15,
                         Migration16,
                         Migration17,
+                        Migration18,
                     )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 System.loadLibrary("sqlcipher")
@@ -427,6 +435,57 @@ abstract class MemoXDatabase : RoomDatabase() {
                 )
                 // `order` is a SQLite reserved word; it must be quoted, mirroring how the Label
                 // table (which also has an `order` column) is created.
+            }
+        }
+
+        /**
+         * 17 -> 18: stable identity, logical content version, explicit content format and
+         * protection state, plus the encryption envelope column.
+         *
+         * Existing locked notes keep their behaviour and are marked [NoteProtection.LEGACY_LOCK];
+         * they are never silently presented as encrypted. UUIDs are random per row: the old
+         * auto-increment id is local-only and cannot be shared across devices.
+         */
+        object Migration18 : Migration(17, 18) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `BaseNote` ADD COLUMN `uuid` TEXT NOT NULL DEFAULT ''")
+                db.execSQL(
+                    "ALTER TABLE `BaseNote` ADD COLUMN `version` INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execSQL(
+                    "ALTER TABLE `BaseNote` ADD COLUMN `contentFormat` TEXT NOT NULL DEFAULT 'RICH_TEXT'"
+                )
+                db.execSQL(
+                    "ALTER TABLE `BaseNote` ADD COLUMN `protection` TEXT NOT NULL DEFAULT 'NONE'"
+                )
+                db.execSQL("ALTER TABLE `BaseNote` ADD COLUMN `payload` TEXT")
+                db.execSQL(
+                    "UPDATE `BaseNote` SET `protection` = 'LEGACY_LOCK' WHERE `locked` = 1"
+                )
+                // RFC 4122 v4-shaped ids. SQLite has no UUID function, so assemble from randomblob.
+                db.execSQL(
+                    "UPDATE `BaseNote` SET `uuid` = " +
+                        "lower(substr(hex(randomblob(4)), 1, 8) || '-' || " +
+                        "substr(hex(randomblob(2)), 1, 4) || '-4' || " +
+                        "substr(hex(randomblob(2)), 2, 3) || '-' || " +
+                        "substr('89ab', abs(random()) % 4 + 1, 1) || " +
+                        "substr(hex(randomblob(2)), 2, 3) || '-' || " +
+                        "substr(hex(randomblob(6)), 1, 12))" +
+                        " WHERE `uuid` = ''"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_BaseNote_uuid` ON `BaseNote` (`uuid`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_BaseNote_modifiedTimestamp` ON `BaseNote` (`modifiedTimestamp`)"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `NoteTombstone` (" +
+                        "`uuid` TEXT NOT NULL, `deletedAt` INTEGER NOT NULL, " +
+                        "`version` INTEGER NOT NULL, `pendingRemote` INTEGER NOT NULL, " +
+                        "`protectedContent` INTEGER NOT NULL DEFAULT 0, " +
+                        "PRIMARY KEY(`uuid`))"
+                )
             }
         }
     }

@@ -18,6 +18,7 @@ import cool.hin.memox.data.model.FolderIdInBaseNote
 import cool.hin.memox.data.model.LabelsInBaseNote
 import cool.hin.memox.data.model.ListItem
 import cool.hin.memox.data.model.Reminder
+import cool.hin.memox.data.model.newNoteUuid
 import cool.hin.memox.data.model.Type
 import cool.hin.memox.presentation.getQuantityString
 import cool.hin.memox.presentation.showToast
@@ -43,7 +44,16 @@ interface BaseNoteDao {
 
     @RawQuery fun query(query: SupportSQLiteQuery): Int
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insert(baseNote: BaseNote): Long
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertRaw(baseNote: BaseNote): Long
+
+    suspend fun insert(baseNote: BaseNote): Long = insertRaw(baseNote.withIdentity())
+
+    private fun BaseNote.withIdentity(): BaseNote {
+        val assignedUuid = if (uuid.isBlank()) newNoteUuid() else uuid
+        val assignedVersion = if (version <= 0) 1L else version
+        return if (assignedUuid == uuid && assignedVersion == version) this
+        else copy(uuid = assignedUuid, version = assignedVersion)
+    }
 
     private fun BaseNote.truncated(): Pair<Boolean, BaseNote> {
         return if (body.length > MAX_BODY_CHAR_LENGTH) {
@@ -103,7 +113,10 @@ interface BaseNoteDao {
         return insert(notes)
     }
 
-    @Insert suspend fun insert(baseNotes: List<BaseNote>): List<Long>
+    @Insert suspend fun insertRaw(baseNotes: List<BaseNote>): List<Long>
+
+    suspend fun insert(baseNotes: List<BaseNote>): List<Long> =
+        insertRaw(baseNotes.map { it.withIdentity() })
 
     @Update(entity = BaseNote::class) suspend fun update(labelsInBaseNotes: List<LabelsInBaseNote>)
 
@@ -145,6 +158,15 @@ interface BaseNoteDao {
     @Query("SELECT B.id FROM BaseNote B") fun getAllIds(): List<Long>
 
     @Query("SELECT * FROM BaseNote WHERE id = :id") fun get(id: Long): BaseNote?
+
+    @Query("SELECT * FROM BaseNote") suspend fun getAllForSync(): List<BaseNote>
+
+    @Query("SELECT * FROM BaseNote WHERE uuid = :uuid LIMIT 1") suspend fun getByUuid(uuid: String): BaseNote?
+
+    @Query("DELETE FROM BaseNote WHERE uuid = :uuid") suspend fun deleteByUuid(uuid: String)
+
+    @Query("UPDATE BaseNote SET folder = :folder, modifiedTimestamp = :timestamp WHERE uuid = :uuid")
+    suspend fun trashByUuid(uuid: String, folder: Folder, timestamp: Long)
 
     @Query("SELECT * FROM BaseNote WHERE title = :title")
     fun getByTitle(title: String): List<BaseNote>

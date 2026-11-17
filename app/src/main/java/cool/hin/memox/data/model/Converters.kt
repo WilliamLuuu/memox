@@ -269,6 +269,27 @@ object Converters {
             }
         }
     }
+
+    @TypeConverter
+    fun contentFormatToString(format: ContentFormat): String = format.name
+
+    @TypeConverter
+    fun stringToContentFormat(value: String): ContentFormat =
+        runCatching { ContentFormat.valueOf(value) }.getOrDefault(ContentFormat.RICH_TEXT)
+
+    @TypeConverter
+    fun protectionToString(protection: NoteProtection): String = protection.name
+
+    @TypeConverter
+    fun stringToProtection(value: String): NoteProtection =
+        runCatching { NoteProtection.valueOf(value) }.getOrDefault(NoteProtection.NONE)
+
+    @TypeConverter
+    fun payloadToJson(payload: ProtectedPayload?): String? = payload?.toJson()
+
+    @TypeConverter
+    fun jsonToPayload(value: String?): ProtectedPayload? =
+        value?.takeIf { it.isNotBlank() }?.let { runCatching { ProtectedPayload.fromJson(it) }.getOrNull() }
 }
 
 fun JSONObject.getSafeString(name: String): String? {

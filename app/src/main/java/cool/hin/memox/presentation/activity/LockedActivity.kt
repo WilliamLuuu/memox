@@ -51,6 +51,17 @@ abstract class LockedActivity<T : ViewBinding> : AppCompatActivity() {
                 Theme.SUPER_DARK -> theme.applyStyle(R.style.AppTheme_SuperDark, true)
                 else -> theme.applyStyle(R.style.AppTheme, true)
             }
+            when (preferences.themeColor.value) {
+                cool.hin.memox.presentation.viewmodel.preference.ThemeColor.GREEN ->
+                    theme.applyStyle(R.style.ThemeOverlay_MemoX_Green, true)
+                cool.hin.memox.presentation.viewmodel.preference.ThemeColor.BLUE ->
+                    theme.applyStyle(R.style.ThemeOverlay_MemoX_Blue, true)
+                cool.hin.memox.presentation.viewmodel.preference.ThemeColor.PURPLE ->
+                    theme.applyStyle(R.style.ThemeOverlay_MemoX_Purple, true)
+                cool.hin.memox.presentation.viewmodel.preference.ThemeColor.ORANGE ->
+                    theme.applyStyle(R.style.ThemeOverlay_MemoX_Orange, true)
+                cool.hin.memox.presentation.viewmodel.preference.ThemeColor.DEFAULT -> Unit
+            }
         }
     }
 

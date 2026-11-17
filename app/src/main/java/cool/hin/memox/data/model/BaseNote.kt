@@ -7,7 +7,13 @@ import androidx.room.PrimaryKey
 /** Format: `#RRGGBB` or `#AARRGGBB` or [BaseNote.COLOR_DEFAULT] */
 typealias ColorString = String
 
-@Entity(indices = [Index(value = ["id", "folder", "pinned", "timestamp", "labels"])])
+@Entity(
+    indices = [
+        Index(value = ["id", "folder", "pinned", "timestamp", "labels"]),
+        Index(value = ["uuid"], unique = true),
+        Index(value = ["modifiedTimestamp"]),
+    ]
+)
 data class BaseNote(
     @PrimaryKey(autoGenerate = true) val id: Long,
     val type: Type,
@@ -28,6 +34,14 @@ data class BaseNote(
     val isPinnedToStatus: Boolean,
     val locked: Boolean = false,
     val folderId: String = "",
+    /** Stable cross-device identity. Legacy rows are backfilled during migration. */
+    val uuid: String = "",
+    /** Logical content version; incremented locally on every committed edit. */
+    val version: Long = 0,
+    val contentFormat: ContentFormat = ContentFormat.RICH_TEXT,
+    val protection: NoteProtection = NoteProtection.NONE,
+    /** Encryption envelope; null for ordinary and legacy-locked notes. */
+    val payload: ProtectedPayload? = null,
 ) : Item {
 
     companion object {
