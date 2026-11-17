@@ -32,7 +32,9 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updateLayoutParams
 import androidx.core.view.isVisible
+import androidx.core.view.updatePadding
 import androidx.core.widget.doAfterTextChanged
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -126,6 +128,8 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
         get() = true
 
     private val autoSaveHandler = Handler(Looper.getMainLooper())
+
+    private var suppressDraft = false
     private val autoSaveRunnable = Runnable {
         lifecycleScope.launch(Dispatchers.Main) {
             updateModel()
@@ -136,14 +140,53 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
         }
     }
 
-    @Suppress("DEPRECATION")
     override fun finish() {
+        val ask =
+            notallyModel.preferences.savePolicy.value ==
+                cool.hin.memox.presentation.viewmodel.preference.SavePolicy.ASK_ON_EXIT
+        if (ask && !isChangingConfigurations && !notallyModel.isEmpty() && notallyModel.isModified()) {
+            showExitSaveDialog()
+            return
+        }
+        closeWithSave()
+    }
+
+    private fun closeWithSave() {
+        @Suppress("DEPRECATION")
         lifecycleScope.launch(Dispatchers.Main) {
             checkSave()
+            suppressDraft = true
+            clearDraft()
+            if (!isChangingConfigurations) {
+                notallyModel.originalNote?.uuid?.takeIf { it.isNotEmpty() }?.let { uuid ->
+                    cool.hin.memox.data.security.NoteCrypto.clearSession(application, uuid)
+                }
+            }
             super.finish()
             // Keep-style close: editor zoom-fades out, the underlying list stays put (no anim).
             overridePendingTransition(0, R.anim.note_zoom_out)
         }
+    }
+
+    private fun showExitSaveDialog() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.save_changes_title)
+            .setMessage(R.string.save_changes_message)
+            .setPositiveButton(R.string.save) { _, _ -> closeWithSave() }
+            .setNegativeButton(R.string.discard_changes) { _, _ ->
+                lifecycleScope.launch {
+                    if (notallyModel.isNewNote) notallyModel.deleteBaseNote()
+                    suppressDraft = true
+                    clearDraft()
+                    notallyModel.originalNote?.uuid?.takeIf { it.isNotEmpty() }?.let {
+                        cool.hin.memox.data.security.NoteCrypto.clearSession(application, it)
+                    }
+                    @Suppress("DEPRECATION") super.finish()
+                    overridePendingTransition(0, R.anim.note_zoom_out)
+                }
+            }
+            .setNeutralButton(android.R.string.cancel, null)
+            .show()
     }
 
     protected open suspend fun checkSave() {
@@ -228,6 +271,12 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
         if (persistedId == null || notallyModel.originalNote == null) {
             notallyModel.setState(id, intent.data == null)
         }
+        if (notallyModel.contentUnavailable) {
+            promptRecoveryPassword(id, initListeners)
+            return
+        }
+
+        restoreDraft()
         if (notallyModel.isNewNote) {
             when (intent.action) {
                 Intent.ACTION_SEND,
@@ -259,6 +308,91 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
         setupEditNoteReminderChip()
     }
 
+    private fun draftKey(): String =
+        notallyModel.originalNote?.uuid?.takeIf { it.isNotEmpty() } ?: "local-${notallyModel.id}"
+
+    private fun restoreDraft() {
+        if (!isAskOnExit() || notallyModel.protection.isEncrypted) return
+        val draft = cool.hin.memox.data.note.NoteDraftStore.load(this, draftKey()) ?: return
+        if (draft.modifiedAt <= notallyModel.modifiedTimestamp) {
+            clearDraft()
+            return
+        }
+        notallyModel.title = draft.title
+        notallyModel.body = android.text.SpannableStringBuilder(draft.body)
+        notallyModel.setLabels(draft.labels)
+        notallyModel.images.value = draft.images
+        notallyModel.files.value = draft.files
+        notallyModel.audios.value = draft.audios
+        notallyModel.modifiedTimestamp = draft.modifiedAt
+    }
+
+    private fun saveDraft() {
+        if (!isAskOnExit() || notallyModel.protection.isEncrypted) return
+        if (notallyModel.isEmpty()) return
+        cool.hin.memox.data.note.NoteDraftStore.save(
+            this,
+            draftKey(),
+            notallyModel.title,
+            notallyModel.body.toString(),
+            notallyModel.labels.toList(),
+            notallyModel.images.value,
+            notallyModel.files.value,
+            notallyModel.audios.value,
+        )
+    }
+
+    private fun clearDraft() {
+        cool.hin.memox.data.note.NoteDraftStore.clear(this, draftKey())
+    }
+
+    private fun isAskOnExit(): Boolean =
+        preferences.savePolicy.value ==
+            cool.hin.memox.presentation.viewmodel.preference.SavePolicy.ASK_ON_EXIT
+
+    override fun onPause() {
+        if (!suppressDraft) saveDraft()
+        super.onPause()
+    }
+    private fun promptRecoveryPassword(id: Long, initListeners: Boolean) {
+        val input =
+            android.widget.EditText(this).apply {
+                hint = getString(R.string.note_recovery_password_hint)
+                inputType =
+                    android.text.InputType.TYPE_CLASS_TEXT or
+                        android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                setSingleLine()
+            }
+        val dialog =
+            MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.note_recovery_password_title)
+                .setMessage(R.string.note_recovery_password_required)
+                .setView(input)
+                .setCancelable(false)
+                .setPositiveButton(android.R.string.ok, null)
+                .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
+                .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val password = input.text.toString()
+                if (password.isEmpty()) {
+                    input.error = getString(R.string.note_recovery_password_empty)
+                    return@setOnClickListener
+                }
+                lifecycleScope.launch {
+                    val unlocked = notallyModel.unlockWithRecovery(password.toCharArray())
+                    if (unlocked) {
+                        dialog.dismiss()
+                        loadNote(id, null, null, initListeners)
+                    } else {
+                        input.error = getString(R.string.note_recovery_password_wrong)
+                    }
+                }
+            }
+        }
+        dialog.show()
+    }
+
     override fun onRestart() {
         super.onRestart()
         lifecycleScope.launch {
@@ -282,46 +416,57 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
         }
     }
 
+    private var lastImeBottomInset = 0
+    private var lastNavBarBottomInset = 0
+
     private fun configureEdgeToEdgeInsets() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        binding.BottomAppBarLayout.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            updateBottomBarSpacing()
+        }
+        binding.MarkdownToolbarScroll.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            updateBottomBarSpacing()
+        }
 
         ViewCompat.setOnApplyWindowInsetsListener(binding.mainContentLayout) { view, insets ->
             val systemBarsInsets = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val imeInsets = insets.getInsets(WindowInsetsCompat.Type.ime()) // For keyboard
+            val imeInsets = insets.getInsets(WindowInsetsCompat.Type.ime())
+            lastImeBottomInset = imeInsets.bottom
+            lastNavBarBottomInset = systemBarsInsets.bottom
+            binding.BottomAppBarLayout.visibility =
+                if (imeInsets.bottom > 0) GONE else VISIBLE
 
-            // Apply top padding to your main content to push it below the status bar
-            // and bottom padding to push it above the navigation bar / keyboard / BottomAppBar
             view.setPadding(
                 systemBarsInsets.left,
                 systemBarsInsets.top,
                 systemBarsInsets.right,
-                // Combine navigation bar inset with keyboard inset for bottom padding
-                // and ensure there's enough space for the BottomAppBar
                 systemBarsInsets.bottom + imeInsets.bottom,
             )
-
-            // Let the BottomAppBar consume its own insets
-            // CoordinatorLayout usually handles this well with its children having specific
-            // behaviors.
-            // If the BottomAppBar isn't adapting, you might need a custom Behavior or ensure its
-            // height is consistent.
-            // A common approach is to set the bottom margin of your main content
-            // to the height of the BottomAppBar + the nav bar inset.
-            val navBarBottom = systemBarsInsets.bottom
-
-            // Option A: Set padding on the ScrollView inside main_content_layout
-            // This is often more effective for scrollable content.
-            binding.ScrollView.apply {
-                setPadding(
-                    paddingLeft,
-                    paddingTop,
-                    paddingRight,
-                    binding.BottomAppBarLayout.height +
-                        navBarBottom, // Space for BottomAppBar + nav bar
-                )
-            }
+            updateBottomBarSpacing()
             insets
         }
+    }
+
+    /**
+     * Markdown 辅助栏位于 BottomAppBar 上方；BottomAppBar 负责避开系统底部手势区。
+     * 键盘弹出时 BottomAppBar 隐藏，辅助栏继续贴着 IME 顶部。
+     */
+    protected fun updateBottomBarSpacing() {
+        val bottomAppBarHeight =
+            if (binding.BottomAppBarLayout.isVisible) binding.BottomAppBarLayout.height else 0
+        binding.BottomAppBarLayout.updateLayoutParams<android.view.ViewGroup.MarginLayoutParams> {
+            bottomMargin = 0
+        }
+        // 主内容底部已经让出了系统导航栏高度；BottomAppBar 自身也覆盖该区域。
+        // 两者都按完整高度叠减会留下一个导航栏高度的空隙，所以这里减掉导航栏 inset。
+        val bottomBarOverlap =
+            (bottomAppBarHeight - lastNavBarBottomInset).coerceAtLeast(0)
+        binding.MarkdownToolbarScroll.updateLayoutParams<android.view.ViewGroup.MarginLayoutParams> {
+            bottomMargin = if (lastImeBottomInset > 0) 0 else bottomBarOverlap
+        }
+        binding.ScrollView.updatePadding(
+            bottom = bottomAppBarHeight + lastNavBarBottomInset,
+        )
     }
 
     override fun onDestroy() {
@@ -331,6 +476,10 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
 
     internal fun resetIdleTimer() {
         autoSaveHandler.removeCallbacks(autoSaveRunnable)
+        val askOnExit =
+            preferences.savePolicy.value ==
+                cool.hin.memox.presentation.viewmodel.preference.SavePolicy.ASK_ON_EXIT
+        if (askOnExit) return
         val idleTime = preferences.autoSaveAfterIdleTime.value
         if (idleTime > -1) {
             autoSaveHandler.postDelayed(autoSaveRunnable, idleTime.toLong() * 1000)
@@ -718,8 +867,10 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
 
     internal fun bindLabels() {
         if (notallyModel.labels.isEmpty()) {
-            binding.LabelsText.visibility = GONE
-            binding.LabelsText.text = ""
+            binding.LabelsText.text = getString(R.string.add_label)
+            binding.LabelsText.visibility = VISIBLE
+            binding.LabelsText.setOnClickListener { promptAddLabel() }
+            binding.LabelsText.setOnLongClickListener(null)
         } else {
             binding.LabelsText.text = notallyModel.labels.joinToString(" ") { "#$it" }
             binding.LabelsText.visibility = VISIBLE
@@ -744,6 +895,27 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
                 true
             }
         }
+    }
+
+    private fun promptAddLabel() {
+        val input =
+            android.widget.EditText(this).apply {
+                hint = getString(R.string.add_label)
+                setSingleLine()
+            }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.add_label)
+            .setView(input)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val value = input.text.toString().trim()
+                if (value.isEmpty()) return@setPositiveButton
+                baseModel.insertLabel(value) {
+                    if (!notallyModel.labels.contains(value)) notallyModel.labels.add(value)
+                    bindLabels()
+                }
+            }
+            .show()
     }
 
     internal fun bindFolder() {
@@ -1049,7 +1221,7 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
         updateBottomActions(preferences.editNoteActivityBottomAction.value)
     }
 
-    protected fun updateTopActions(topActions: List<EditAction>, changeable: Boolean = true) {
+    protected open fun updateTopActions(topActions: List<EditAction>, changeable: Boolean = true) {
         binding.Toolbar.menu.apply {
             clear()
             topActions.forEachIndexed { idx, action ->
@@ -1138,6 +1310,7 @@ abstract class EditActivity(private val type: Type) : LockedActivity<ActivityEdi
     }
 
     private fun unlockNoteContent() {
+        cool.hin.memox.data.security.SecuritySession.onAuthenticated()
         binding.ScrollView.visibility = VISIBLE
     }
 

@@ -51,10 +51,18 @@
 
         </com.google.android.material.appbar.MaterialToolbar>
 
+        <LinearLayout
+            android:id="@+id/EditorBody"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal">
+
         <me.zhanghai.android.fastscroll.FastScrollNestedScrollView
             android:id="@+id/ScrollView"
-            android:layout_width="match_parent"
+            android:layout_width="0dp"
             android:layout_height="match_parent"
+            android:layout_weight="1"
             android:fillViewport="true"
             android:visibility="gone"
             android:clipToPadding="false"
@@ -291,6 +299,38 @@
             </LinearLayout>
 
         </me.zhanghai.android.fastscroll.FastScrollNestedScrollView>
+
+        <TextView
+            android:id="@+id/MarkdownPreview"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:padding="16dp"
+            android:scrollbars="vertical"
+            android:textIsSelectable="true"
+            android:visibility="gone"
+            android:textAppearance="?attr/textAppearanceBodyLarge" />
+
+        </LinearLayout>
+
+        <HorizontalScrollView
+            android:id="@+id/MarkdownToolbarScroll"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:visibility="gone"
+            android:scrollbars="none"
+            android:background="?attr/colorSurfaceContainer">
+
+            <LinearLayout
+                android:id="@+id/MarkdownToolbar"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:paddingStart="8dp"
+                android:paddingEnd="8dp"
+                android:paddingTop="2dp"
+                android:paddingBottom="2dp" />
+        </HorizontalScrollView>
 
     </LinearLayout>
 

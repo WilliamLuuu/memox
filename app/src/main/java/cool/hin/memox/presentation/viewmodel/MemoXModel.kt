@@ -32,10 +32,14 @@ import cool.hin.memox.data.model.ListItem
 import cool.hin.memox.data.model.Reminder
 import cool.hin.memox.data.model.SpanRepresentation
 import cool.hin.memox.data.model.Type
+import cool.hin.memox.data.model.ContentFormat
+import cool.hin.memox.data.model.NoteProtection
+import cool.hin.memox.data.model.ProtectedPayload
 import cool.hin.memox.data.model.attachmentsDifferFrom
 import cool.hin.memox.data.model.copy
 import cool.hin.memox.data.model.deepCopy
 import cool.hin.memox.data.sync.SyncRouter
+import cool.hin.memox.data.security.NoteCrypto
 import cool.hin.memox.presentation.IMAGE_PLACEHOLDER
 import cool.hin.memox.presentation.InlineImageSpan
 import cool.hin.memox.presentation.activity.note.reminders.ReminderReceiver
@@ -70,6 +74,38 @@ import kotlinx.coroutines.withContext
 
 typealias BackupFile = Pair<String?, File>
 
+/**
+ * Business-state equality used when deciding whether a save changed the note. It keeps the old
+ * "no substantive change" behaviour (body, title, type, spans and items) and extends it to every
+ * other user-visible field. Identity, version, modified time and the encryption envelope are
+ * deliberately excluded: they change on each commit or are decided by the commit itself.
+ */
+fun BaseNote.hasSameBusinessState(other: BaseNote?): Boolean =
+    other != null &&
+        equalContents(other) &&
+        folder == other.folder &&
+        color == other.color &&
+        pinned == other.pinned &&
+        timestamp == other.timestamp &&
+        labels == other.labels &&
+        images == other.images &&
+        files == other.files &&
+        audios == other.audios &&
+        reminders == other.reminders &&
+        isPinnedToStatus == other.isPinnedToStatus &&
+        locked == other.locked &&
+        folderId == other.folderId &&
+        contentFormat == other.contentFormat &&
+        protection == other.protection
+
+/** Modified time to commit: a no-op save keeps the stored time, a real edit takes the new one. */
+fun commitTimestamp(current: BaseNote, original: BaseNote?): Long =
+    if (original != null && current.hasSameBusinessState(original)) {
+        original.modifiedTimestamp
+    } else {
+        current.modifiedTimestamp
+    }
+
 class MemoXModel(private val app: Application) : AndroidViewModel(app) {
 
     private val database = MemoXDatabase.getDatabase(app)
@@ -90,6 +126,14 @@ class MemoXModel(private val app: Application) : AndroidViewModel(app) {
     var pinned = false
     var isPinnedToStatus = false
     var locked = false
+    var protection = NoteProtection.NONE
+    var contentFormat =
+        if (preferences.markdownByDefault.value) ContentFormat.MARKDOWN else ContentFormat.RICH_TEXT
+    var payload: ProtectedPayload? = null
+    /** Password used to wrap the content key for other devices; never persisted. */
+    var recoveryPassword: CharArray? = null
+    /** True when the stored note is encrypted but could not be opened on this device yet. */
+    var contentUnavailable = false
     var timestamp = System.currentTimeMillis()
     var modifiedTimestamp = System.currentTimeMillis()
 
@@ -402,7 +446,23 @@ class MemoXModel(private val app: Application) : AndroidViewModel(app) {
             isNewNote = false
 
             val cachedNote = Cache.list.find { baseNote -> baseNote.id == id }
-            val baseNote = cachedNote ?: withContext(Dispatchers.IO) { baseNoteDao.get(id) }
+            val storedNote = cachedNote ?: withContext(Dispatchers.IO) { baseNoteDao.get(id) }
+            var baseNote = storedNote
+            contentUnavailable = false
+            if (storedNote != null && storedNote.protection == NoteProtection.ENCRYPTED) {
+                baseNote =
+                    try {
+                        val opened = withContext(Dispatchers.IO) { NoteCrypto.open(storedNote) }
+                        withContext(Dispatchers.IO) {
+                            NoteCrypto.materializeAttachments(app, opened.note)
+                        }
+                        opened.note
+                    } catch (e: Exception) {
+                        contentUnavailable = true
+                        app.log("MemoXModel", msg = "Encrypted note could not be opened", throwable = e)
+                        storedNote
+                    }
+            }
 
             if (baseNote != null) {
                 originalNote = baseNote.deepCopy()
@@ -418,8 +478,20 @@ class MemoXModel(private val app: Application) : AndroidViewModel(app) {
 
                 setLabels(baseNote.labels)
                 folderId = baseNote.folderId
+                protection = baseNote.protection
+                contentFormat = baseNote.contentFormat
+                payload = baseNote.payload
 
-                body = baseNote.body.applySpans(baseNote.spans)
+                // Markdown 笔记的正文是源码，旧版本预览产生的富文本 span 不能带入编辑器，
+                // 否则当前行会残留粗体/字号等样式，看起来像源码没有完整恢复。
+                body =
+                    baseNote.body.applySpans(
+                        if (baseNote.contentFormat == ContentFormat.MARKDOWN) {
+                            emptyList()
+                        } else {
+                            baseNote.spans
+                        },
+                    )
 
                 items.clear()
                 items.addAll(baseNote.items)
@@ -440,23 +512,62 @@ class MemoXModel(private val app: Application) : AndroidViewModel(app) {
                 originalNote = createBaseNote(createInDb)
                 app.showToast(R.string.cant_find_note)
             }
+
         } else originalNote = createBaseNote(createInDb)
+    }
+
+    /** Adopt an encrypted note from another device using its recovery password. */
+    suspend fun unlockWithRecovery(password: CharArray): Boolean {
+        val stored = originalNote ?: return false
+        if (stored.uuid.isBlank()) return false
+        return try {
+            val adopted = withContext(Dispatchers.IO) { NoteCrypto.adoptRecoveredNote(stored, password) }
+            withContext(Dispatchers.IO) { baseNoteDao.insertSafe(app, adopted) }
+            setState(id)
+            !contentUnavailable
+        } catch (e: Exception) {
+            app.log("MemoXModel", msg = "Recovery password rejected", throwable = e)
+            false
+        }
     }
 
     private suspend fun createBaseNote(createInDb: Boolean = true): BaseNote {
         val baseNote = getBaseNote()
-        if (createInDb) {
-            id = withContext(Dispatchers.IO) { baseNoteDao.insertSafe(app, baseNote) }
-        }
-        return baseNote.copy(id = id)
+        if (!createInDb) return baseNote
+        val insertedNote =
+            withContext(Dispatchers.IO) {
+                id = baseNoteDao.insertSafe(app, baseNote)
+                // The UUID is assigned inside insert; reload so the editor seals against the
+                // persisted identity instead of an empty one.
+                baseNoteDao.get(id) ?: baseNote.copy(id = id)
+            }
+        return insertedNote
     }
 
     suspend fun deleteBaseNote() {
         app.cancelPinAndReminders(id, reminders.value)
-        // Delete from the active sync provider before deleting locally (need note data for filename/attachments)
-        try {
-            SyncRouter.deleteRemoteNote(app, getBaseNote())
-        } catch (_: Exception) {}
+        val note = getBaseNote()
+        if (note.protection == NoteProtection.ENCRYPTED) {
+            // Protected content is never physically removed from remote storage without a local,
+            // authenticated confirmation; record the intent and let the sync engine propagate it.
+            withContext(Dispatchers.IO) {
+                MemoXDatabase.getDatabase(app)
+                    .value
+                    .getTombstoneDao()
+                    .upsert(
+                        cool.hin.memox.data.model.NoteTombstone(
+                            uuid = note.uuid,
+                            deletedAt = System.currentTimeMillis(),
+                            version = note.version,
+                            protectedContent = true,
+                        )
+                    )
+            }
+        } else {
+            try {
+                SyncRouter.deleteRemoteNote(app, note)
+            } catch (_: Exception) {}
+        }
         withContext(Dispatchers.IO) { baseNoteDao.delete(id) }
         WidgetProvider.sendBroadcast(app, longArrayOf(id))
         val attachments = ArrayList(images.value + files.value + audios.value)
@@ -471,10 +582,41 @@ class MemoXModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     suspend fun saveNote(): Long {
+        // Never overwrite a sealed payload we could not open: that would destroy the content.
+        if (contentUnavailable) return id
         return withContext(Dispatchers.IO) {
-            val note = getBaseNote()
+            val plain = getBaseNote()
+            val original = originalNote
+            // Decide the modification time from plaintext: sealing destroys the body/items and
+            // binds modifiedTimestamp into metadataMac, so it must not happen before this step.
+            val committedTimestamp = commitTimestamp(plain, original)
+            // Advance the version exactly once, in the layer that produces the persisted note:
+            // seal() bumps it internally; the plaintext paths bump it below. Keeping the pre-seal
+            // version equal to the stored one also keeps NoteCrypto.open's MAC/AAD check valid.
+            val baseVersion = original?.version ?: 0
+            val plaintext = plain.copy(modifiedTimestamp = committedTimestamp, version = baseVersion)
+            val changed = !plaintext.hasSameBusinessState(original)
+
+            val note =
+                when {
+                    protection == NoteProtection.ENCRYPTED ->
+                        NoteCrypto.seal(app, plaintext, recoveryPassword)
+                    plain.payload != null -> {
+                        val opened = NoteCrypto.open(plaintext)
+                        // makePlain restores the stored (decrypted) body; the editor's current
+                        // plaintext is authoritative, so keep it instead of the old content.
+                        NoteCrypto.makePlain(app, opened.note)
+                            .copy(
+                                version = baseVersion + 1,
+                                body = plain.body,
+                                spans = plain.spans,
+                                items = plain.items,
+                            )
+                    }
+                    else -> plaintext.copy(version = baseVersion + 1)
+                }
             val id = baseNoteDao.insertSafe(app, note)
-            if (!note.equalContents(originalNote)) {
+            if (changed) {
                 app.sendBroadcast(
                     Intent(app, ReminderReceiver::class.java).apply {
                         action = ReminderReceiver.ACTION_UPDATE_NOTIFICATIONS
@@ -482,7 +624,14 @@ class MemoXModel(private val app: Application) : AndroidViewModel(app) {
                     }
                 )
             }
-            originalNote = note.deepCopy()
+            payload = note.payload
+            this@MemoXModel.id = if (this@MemoXModel.id == 0L) id else this@MemoXModel.id
+            // Keep a plaintext mirror for change detection while the editor is open. It must
+            // carry the committed version, timestamp and envelope — only body/spans/items are
+            // restored — so an export taken before any async refresh cannot mix a stale version
+            // with the new payload's MAC.
+            originalNote =
+                note.deepCopy().copy(body = plain.body, spans = plain.spans, items = plain.items)
             return@withContext id
         }
     }
@@ -536,12 +685,19 @@ class MemoXModel(private val app: Application) : AndroidViewModel(app) {
             isPinnedToStatus,
             locked,
             folderId,
+            uuid = originalNote?.uuid.orEmpty(),
+            version = originalNote?.version ?: 0,
+            contentFormat = contentFormat,
+            protection = protection,
+            payload = payload,
         )
     }
 
     private fun getFilteredSpans(spanned: Spanned): ArrayList<SpanRepresentation> {
         val representations = LinkedHashSet<SpanRepresentation>()
         spanned.getSpans<CharacterStyle>().forEach { span ->
+            // 行内 Markdown 预览 span 只用于编辑器显示，不能写进笔记的富文本格式。
+            if (span is cool.hin.memox.presentation.markdown.MarkdownLiveSpan) return@forEach
             val end = spanned.getSpanEnd(span)
             val start = spanned.getSpanStart(span)
             val representation =

@@ -15,11 +15,19 @@ open class EditTextWithWatcher(context: Context, attrs: AttributeSet) :
     AppCompatEditText(context, attrs) {
     var textWatcher: TextWatcher? = null
     private var onSelectionChange: ((selStart: Int, selEnd: Int) -> Unit)? = null
+    private var extraSelectionListeners: MutableList<(selStart: Int, selEnd: Int) -> Unit>? = null
     private var keyListenerInstance: KeyListener? = null
 
     override fun onSelectionChanged(selStart: Int, selEnd: Int) {
         super.onSelectionChanged(selStart, selEnd)
         onSelectionChange?.invoke(selStart, selEnd)
+        extraSelectionListeners?.forEach { it(selStart, selEnd) }
+    }
+
+    fun addOnSelectionChangeListener(callback: (selStart: Int, selEnd: Int) -> Unit) {
+        val listeners = extraSelectionListeners ?: mutableListOf()
+        listeners.add(callback)
+        extraSelectionListeners = listeners
     }
 
     fun setOnSelectionChange(callback: (selStart: Int, selEnd: Int) -> Unit) {

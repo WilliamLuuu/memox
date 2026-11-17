@@ -4,6 +4,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.text.style.URLSpan
 import android.view.View
 import android.view.View.GONE
@@ -13,9 +15,18 @@ import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.view.isVisible
 import androidx.core.view.updateLayoutParams
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.google.android.material.R as MaterialR
+import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import android.os.Handler
+import android.os.Looper
+import android.widget.TextView
 import cool.hin.memox.R
 import cool.hin.memox.data.model.Type
+import cool.hin.memox.data.model.ContentFormat
+import cool.hin.memox.presentation.markdown.MarkdownLiveStyler
+import cool.hin.memox.presentation.markdown.nextMarkdownListPrefix
+import cool.hin.memox.presentation.markdown.MarkdownRenderer
 import cool.hin.memox.data.model.getNoteIdFromUrl
 import cool.hin.memox.data.model.getNoteTypeFromUrl
 import cool.hin.memox.data.model.isNoteUrl
@@ -53,6 +64,9 @@ class EditNoteActivity : EditActivity(Type.NOTE) {
 
         // NOTE-type notes render images inline in the body, so the top image gallery is hidden.
         binding.ImageLayout.visibility = GONE
+
+        setupMarkdownMode()
+        setupMarkdownLiveStyler()
 
         if (notallyModel.isNewNote) {
             binding.EnterBody.requestFocus()
@@ -102,8 +116,271 @@ class EditNoteActivity : EditActivity(Type.NOTE) {
             if (textChanged) {
                 updateSearchResults(search.query)
                 updateJumpButtonsVisibility()
+                scheduleMarkdownPreview()
             }
         }
+    }
+
+    private data class MdAction(
+        val label: String?,
+        val iconRes: Int,
+        val descriptionRes: Int,
+        val action: () -> Unit,
+    )
+
+    private var markdownPreviewVisible = false
+    private var pendingNewline = false
+    private val previewHandler = Handler(Looper.getMainLooper())
+    private var previewRunnable: Runnable? = null
+
+    private val markdownLiveStyler by lazy {
+        MarkdownLiveStyler(
+            binding.EnterBody,
+            MaterialColors.getColor(binding.EnterBody, MaterialR.attr.colorPrimary),
+            MaterialColors.getColor(binding.EnterBody, MaterialR.attr.colorOnSurfaceVariant),
+            MaterialColors.getColor(binding.EnterBody, MaterialR.attr.colorSurfaceVariant),
+        )
+    }
+
+    private fun continueMarkdownList(editable: Editable?) {
+        if (editable == null) return
+        val cursor = binding.EnterBody.selectionStart
+        if (cursor != binding.EnterBody.selectionEnd) return
+        if (cursor < 2 || editable[cursor - 1] != '\n') return
+
+        val lineStart = editable.lastIndexOf('\n', cursor - 2) + 1
+        val previousLine = editable.subSequence(lineStart, cursor - 1).toString()
+        val prefix = nextMarkdownListPrefix(previousLine) ?: return
+
+        editable.insert(cursor, prefix)
+        binding.EnterBody.setSelection(cursor + prefix.length)
+    }
+
+    private fun setupMarkdownLiveStyler() {
+        // 行内预览只改变 Editable 上的 span，不改原始文本；每次输入/移动光标后短暂防抖重排。
+        markdownLiveStyler
+        binding.EnterBody.addTextChangedListener(
+            object : TextWatcher {
+                override fun beforeTextChanged(
+                    s: CharSequence?,
+                    start: Int,
+                    count: Int,
+                    after: Int,
+                ) = Unit
+
+                override fun onTextChanged(
+                    s: CharSequence?,
+                    start: Int,
+                    before: Int,
+                    count: Int,
+                ) {
+                    // 只处理“刚插入一个换行”的情况，避免移动光标/删除时误续写列表。
+                    pendingNewline = count == 1 && before == 0 && s?.getOrNull(start) == '\n'
+                }
+
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    if (pendingNewline) {
+                        pendingNewline = false
+                        if (markdownLiveStyler.isEnabled) continueMarkdownList(s)
+                    }
+                    markdownLiveStyler.schedule()
+                }
+            }
+        )
+        binding.EnterBody.addOnSelectionChangeListener { _, _ -> markdownLiveStyler.schedule() }
+    }
+
+    override fun updateTopActions(topActions: List<EditAction>, changeable: Boolean) {
+        super.updateTopActions(topActions, changeable)
+        // updateTopActions 会 clear 菜单，必须在它之后补上 Markdown 入口，
+        // 否则“预览 / 使用 Markdown”永远不会出现在工具栏里。
+        setupMarkdownMode()
+    }
+
+    private fun setupMarkdownMode() {
+        val isMarkdown = notallyModel.contentFormat == ContentFormat.MARKDOWN
+        binding.MarkdownToolbar.removeAllViews()
+        binding.MarkdownToolbarScroll.isVisible = isMarkdown
+        updateBottomBarSpacing()
+        markdownLiveStyler.setEnabled(isMarkdown && !markdownPreviewVisible)
+        binding.Toolbar.menu.removeItem(R.id.MenuToggleMarkdownPreview)
+        binding.Toolbar.menu.removeItem(R.id.MenuToggleContentFormat)
+        binding.Toolbar.inflateMenu(R.menu.menu_markdown)
+        val previewItem = binding.Toolbar.menu.findItem(R.id.MenuToggleMarkdownPreview)
+        previewItem.isVisible = isMarkdown
+        previewItem.setOnMenuItemClickListener {
+            toggleMarkdownPreview()
+            true
+        }
+        val formatItem = binding.Toolbar.menu.findItem(R.id.MenuToggleContentFormat)
+        // 格式切换对已有笔记同样开放：否则旧笔记只能以 RICH_TEXT 打开，正文里的
+        // Markdown 源文（##、** 等）永远不会被渲染，看起来就是“不支持 Markdown”。
+        formatItem.isVisible = true
+        formatItem.setTitle(if (isMarkdown) R.string.markdown_use_rich else R.string.markdown_use)
+        formatItem.setOnMenuItemClickListener {
+            notallyModel.contentFormat =
+                if (isMarkdown) ContentFormat.RICH_TEXT else ContentFormat.MARKDOWN
+            markdownPreviewVisible = false
+            binding.MarkdownPreview.isVisible = false
+            binding.ScrollView.isVisible = true
+            setupMarkdownMode()
+            true
+        }
+        if (!isMarkdown) return
+        val actions: List<MdAction> =
+            listOf(
+                MdAction("H1", 0, R.string.md_h1) { insertAtLineStart("# ") },
+                MdAction("H2", 0, R.string.md_h2) { insertAtLineStart("## ") },
+                MdAction("H3", 0, R.string.md_h3) { insertAtLineStart("### ") },
+                MdAction(null, R.drawable.format_bold, R.string.md_bold) {
+                    surround("**", "**", getString(R.string.md_text))
+                },
+                MdAction(null, R.drawable.format_italic, R.string.md_italic) {
+                    surround("*", "*", getString(R.string.md_text))
+                },
+                MdAction(null, R.drawable.format_strikethrough, R.string.md_strike) {
+                    surround("~~", "~~", getString(R.string.md_text))
+                },
+                MdAction(null, R.drawable.code, R.string.md_inline_code) {
+                    surround("`", "`", "code")
+                },
+                MdAction(null, R.drawable.format_list_bulleted, R.string.md_list) {
+                    insertAtLineStart("- ")
+                },
+                MdAction(null, R.drawable.format_list_numbered, R.string.md_numbered_list) {
+                    insertAtLineStart("1. ")
+                },
+                MdAction(null, R.drawable.checkbox_outline, R.string.md_task) {
+                    insertAtLineStart("- [ ] ")
+                },
+                MdAction(null, R.drawable.format_quote, R.string.md_quote) {
+                    insertAtLineStart("> ")
+                },
+                MdAction(null, R.drawable.code_block, R.string.md_code_block) {
+                    surround("```\n", "\n```", "")
+                },
+                MdAction(null, R.drawable.format_table, R.string.md_table) {
+                    surround(
+                        "| 列 1 | 列 2 |\n| --- | --- |\n| ",
+                        " |  |\n",
+                        getString(R.string.md_text),
+                    )
+                },
+                MdAction(null, R.drawable.format_horizontal_rule, R.string.md_rule) {
+                    surround("\n---\n", "", "")
+                },
+                MdAction(null, R.drawable.link, R.string.md_link) {
+                    surround("[", "](https://)", getString(R.string.md_link_text))
+                },
+                MdAction(null, R.drawable.add_images, R.string.md_image) {
+                    surround("![", "](image.png)", getString(R.string.md_text))
+                },
+            )
+        val color =
+            com.google.android.material.color.MaterialColors.getColor(
+                binding.MarkdownToolbar,
+                com.google.android.material.R.attr.colorOnSurfaceVariant,
+            )
+        val size = 36.dp
+        val selectable = android.util.TypedValue()
+        theme.resolveAttribute(
+            android.R.attr.selectableItemBackgroundBorderless,
+            selectable,
+            true,
+        )
+        actions.forEach { action ->
+            val view: View =
+                if (action.iconRes != 0) {
+                    androidx.appcompat.widget.AppCompatImageButton(this).apply {
+                        setImageResource(action.iconRes)
+                        imageTintList = android.content.res.ColorStateList.valueOf(color)
+                        setBackgroundResource(selectable.resourceId)
+                        val padding = 6.dp
+                        setPadding(padding, padding, padding, padding)
+                    }
+                } else {
+                    TextView(this).apply {
+                        text = action.label
+                        gravity = android.view.Gravity.CENTER
+                        setTypeface(typeface, android.graphics.Typeface.BOLD)
+                        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+                        setTextColor(color)
+                        setBackgroundResource(selectable.resourceId)
+                    }
+                }
+            view.layoutParams = LinearLayout.LayoutParams(size, size)
+            view.contentDescription = getString(action.descriptionRes)
+            view.setOnClickListener { action.action() }
+            binding.MarkdownToolbar.addView(view)
+        }
+    }
+
+    private fun toggleMarkdownPreview() {
+        markdownPreviewVisible = !markdownPreviewVisible
+        val wide = resources.configuration.screenWidthDp >= 600
+        binding.MarkdownPreview.isVisible = markdownPreviewVisible
+        // Wide windows keep source and preview side by side; phones swap them.
+        binding.ScrollView.isVisible = !markdownPreviewVisible || wide
+        binding.MarkdownToolbarScroll.isVisible = !markdownPreviewVisible
+        updateBottomBarSpacing()
+        markdownLiveStyler.setEnabled(
+            notallyModel.contentFormat == ContentFormat.MARKDOWN && !markdownPreviewVisible
+        )
+        binding.Toolbar.menu
+            .findItem(R.id.MenuToggleMarkdownPreview)
+            .setTitle(
+                if (markdownPreviewVisible) R.string.markdown_edit_source
+                else R.string.markdown_preview
+            )
+        if (markdownPreviewVisible) {
+            if (!wide) hideKeyboard(binding.EnterBody)
+            renderMarkdownPreview()
+        }
+    }
+
+    private fun scheduleMarkdownPreview() {
+        if (!markdownPreviewVisible) return
+        if (!notallyModel.preferences.markdownLivePreview.value) return
+        previewRunnable?.let { previewHandler.removeCallbacks(it) }
+        val runnable =
+            Runnable {
+                if (markdownPreviewVisible) renderMarkdownPreview()
+            }
+        previewRunnable = runnable
+        previewHandler.postDelayed(runnable, 180)
+    }
+
+    private fun renderMarkdownPreview() {
+        MarkdownRenderer.renderInto(binding.MarkdownPreview, notallyModel.body.toString())
+    }
+
+    private fun surround(before: String, after: String, placeholder: String) {
+        val body = binding.EnterBody
+        val editable = body.text ?: return
+        val start = body.selectionStart.coerceAtLeast(0)
+        val end = body.selectionEnd.coerceAtLeast(start)
+        val selected = editable.substring(start, end)
+        val content = selected.ifEmpty { placeholder }
+        editable.replace(start, end, before + content + after)
+        body.setSelection(start + before.length + content.length)
+        notallyModel.body = editable
+    }
+
+    private fun insertAtLineStart(prefix: String) {
+        val body = binding.EnterBody
+        val editable = body.text ?: return
+        val cursor = body.selectionStart.coerceAtLeast(0)
+        val lineStart = editable.lastIndexOf('\n', (cursor - 1).coerceAtLeast(0)).let {
+            if (it < 0) 0 else it + 1
+        }
+        editable.insert(lineStart, prefix)
+        body.setSelection(cursor + prefix.length)
+        notallyModel.body = editable
+    }
+
+    override fun onDestroy() {
+        previewRunnable?.let { previewHandler.removeCallbacks(it) }
+        super.onDestroy()
     }
 
     override fun setStateFromModel(savedInstanceState: Bundle?) {

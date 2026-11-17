@@ -65,7 +65,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("release")
+            // CI injects RELEASE_STORE_FILE; without it emit an unsigned APK for local verification.
+            if (providers.gradleProperty("RELEASE_STORE_FILE").orNull != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         create("beta"){
             initWith(getByName("release"))
@@ -264,6 +267,7 @@ dependencies {
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
     implementation("androidx.work:work-runtime:2.9.1")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("cat.ereza:customactivityoncrash:2.4.0")
@@ -284,6 +288,7 @@ dependencies {
     }
     implementation("org.commonmark:commonmark:0.27.0")
     implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.27.0")
+    implementation("org.commonmark:commonmark-ext-gfm-tables:0.27.0")
     implementation("com.github.luben:zstd-jni:1.5.7-6@aar")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
