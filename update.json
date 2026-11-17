@@ -1,6 +1,6 @@
 {
-  "version": "1.2.63",
-  "versionCode": 12063,
-  "changelog": "更新说明：\n- 修复：笔记状态同步问题",
+  "version": "1.2.64",
+  "versionCode": 12076,
+  "changelog": "更新说明：\n- 新增：Markdown 编辑与实时渲染、首页日期/标签/文件夹筛选、主题色预设\n- 新增：本地 Agent API 与桌面 MCP adapter\n- 修复：加密保存时间与版本一致性、搜索竞态与日志隐私、日期筛选时区与夏令时边界、日历导出兼容性",
   "releaseUrl": "https://cnb.cool/hin/memoX/-/releases"
 }

@@ -27,7 +27,7 @@ Fork 自 [NotallyX](https://github.com/PhilKas/NotallyX)，进行了大量 UI �
 - **标签** — 使用标签分类管理笔记
 - **提醒** — 为笔记设置提醒
 - **搜索** — 可展开的搜索框，支持搜索正文
-- **自选同步** — 通过 WebDAV 服务器或 oneDrive 双向同步笔记和附件
+- **自选同步** — 通过 WebDAV 服务器或 OneDrive 双向同步笔记和附件
   - 笔记修改后自动上传
   - 启动应用时自动同步更新
   - 每 5 分钟定时双向同步
@@ -45,7 +45,7 @@ Fork 自 [NotallyX](https://github.com/PhilKas/NotallyX)，进行了大量 UI �
 
 ![memoX设置](./doc/memox_setting.jpg)
 
-## TODO
+## ToDo
 
 1.一些细小的使用体验优化，并加强笔记加密；
 
@@ -66,6 +66,14 @@ Fork 自 [NotallyX](https://github.com/PhilKas/NotallyX)，进行了大量 UI �
 调试版 APK 输出路径：`app/build/outputs/apk/debug/`
 
 > 注：项目的 `settings.gradle.kts` 已配置国内 Maven 镜像（腾讯云 + 阿里云 Gradle Plugin Portal），在中国大陆网络环境下可稳定解析依赖。若自行克隆构建遇到插件/依赖解析失败，请确认镜像配置未被移除。
+
+## 使用文档
+
+完整功能说明、导入/导出的文件结构与字段定义见 [docs/user-guide.md](docs/user-guide.md)。
+
+功能名称、界面位置与代码组件的对应关系见 [docs/architecture.md](docs/architecture.md)。
+
+本地/局域网 AI Agent 读写接口（鉴权、地址配置、端点、MCP 配置）见 [docs/agent-api.md](docs/agent-api.md)。
 
 ## 开源许可
 

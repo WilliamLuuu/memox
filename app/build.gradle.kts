@@ -4,6 +4,49 @@ import org.apache.commons.configuration2.PropertiesConfiguration
 import org.apache.commons.configuration2.io.FileHandler
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import java.util.concurrent.TimeUnit
+
+// versionCode: prefer total Git commits (strictly monotonic with history); offline fallback
+// stays just above the released baseline so later builds can always overwrite.
+fun gitCommitCount(): Int? =
+    try {
+        val process =
+            ProcessBuilder("git", "rev-list", "--count", "HEAD")
+                .directory(project.rootDir)
+                .redirectErrorStream(true)
+                .start()
+        val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+        if (process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0) {
+            output.toIntOrNull()
+        } else {
+            null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+fun gitShortHash(): String? =
+    try {
+        val process =
+            ProcessBuilder("git", "rev-parse", "--short=7", "HEAD")
+                .directory(project.rootDir)
+                .redirectErrorStream(true)
+                .start()
+        val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+        if (process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0 && output.isNotEmpty()) {
+            output
+        } else {
+            null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+val baseVersionName = project.findProperty("app.versionName")?.toString() ?: "1.2.64"
+// Keep monotonicity with the released baseline (v1.2.63 shipped versionCode 12063):
+// git commit count grows by one per commit; the offline fallback stays just above the baseline.
+val versionCodeBase = 12063
+val computedVersionCode = versionCodeBase + (gitCommitCount() ?: 1)
 
 plugins {
     id("com.android.application")
@@ -24,8 +67,8 @@ android {
         applicationId = "cool.hin.memox"
         minSdk = 21
         targetSdk = 36
-        versionCode = project.findProperty("app.versionCode").toString().toInt()
-        versionName = project.findProperty("app.versionName").toString()
+        versionCode = computedVersionCode
+        versionName = baseVersionName
         resourceConfigurations += listOf(
             "en", "ar", "ca", "cs", "da", "de", "el", "es", "fr", "hu", "in", "it", "ja", "my", "nb", "nl", "nn", "pl", "pt-rBR", "pt-rPT", "ro", "ru", "sk", "sv", "tl", "tr", "uk", "vi", "zh-rCN", "zh-rTW"
         )
@@ -54,7 +97,7 @@ android {
     buildTypes {
         debug {
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-DEBUG"
+            versionNameSuffix = "-DEBUG" + (gitShortHash()?.let { "-$it" } ?: "")
             resValue("string", "app_name", "memoX DEBUG")
         }
         release {
@@ -73,7 +116,7 @@ android {
         create("beta"){
             initWith(getByName("release"))
             applicationIdSuffix = ".beta"
-            versionNameSuffix = "-BETA"
+            versionNameSuffix = "-BETA" + (gitShortHash()?.let { "-$it" } ?: "")
             resValue("string", "app_name", "memoX BETA")
         }
     }
