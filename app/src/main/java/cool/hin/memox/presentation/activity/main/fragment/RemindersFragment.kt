@@ -1,14 +1,20 @@
 package cool.hin.memox.presentation.activity.main.fragment
 
+import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import androidx.lifecycle.LiveData
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.view.isVisible
 import androidx.lifecycle.MutableLiveData
 import androidx.recyclerview.widget.SortedListAdapterCallback
 import cool.hin.memox.R
 import cool.hin.memox.data.model.BaseNote
 import cool.hin.memox.data.model.Item
 import cool.hin.memox.data.model.hasAnyUpcomingNotifications
+import cool.hin.memox.presentation.activity.note.PickNoteActivity
+import cool.hin.memox.presentation.activity.note.reminders.RemindersActivity
 import cool.hin.memox.presentation.view.main.BaseNoteAdapter
 import cool.hin.memox.presentation.view.main.sorting.BaseNoteLastNotificationSort
 import cool.hin.memox.presentation.view.main.sorting.BaseNoteMostRecentNotificationSort
@@ -16,13 +22,31 @@ import cool.hin.memox.presentation.view.main.sorting.BaseNoteNextNotificationSor
 import cool.hin.memox.presentation.viewmodel.preference.SortDirection
 
 class RemindersFragment : MemoXFragment() {
-    private val currentReminderNotes = MutableLiveData<List<Item>>()
+    private val currentReminderNotes = MutableLiveData<List<Item>>(emptyList())
     private val allReminderNotes: LiveData<List<Item>> by lazy { model.reminderNotes!! }
     private var filterMode = FilterOptions.UPCOMING
 
+    private val pickNoteForReminder =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val id =
+                    result.data?.getLongExtra(PickNoteActivity.EXTRA_PICKED_NOTE_ID, -1L) ?: -1L
+                if (id != -1L) {
+                    startActivity(
+                        Intent(requireContext(), RemindersActivity::class.java)
+                            .putExtra(RemindersActivity.NOTE_ID, id)
+                    )
+                }
+            }
+        }
+
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        currentReminderNotes.value = allReminderNotes.value
+        currentReminderNotes.value = allReminderNotes.value ?: emptyList()
+        binding?.ListFab?.isVisible = true
+        binding?.ListFab?.setOnClickListener {
+            pickNoteForReminder.launch(Intent(requireContext(), PickNoteActivity::class.java))
+        }
         binding?.ReminderFilter?.visibility = View.VISIBLE
         allReminderNotes.observe(viewLifecycleOwner) { _ -> applyFilter(filterMode) }
         binding?.ReminderFilter?.setOnCheckedStateChangeListener { _, checkedIds ->

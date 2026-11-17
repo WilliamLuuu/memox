@@ -23,8 +23,8 @@ import cool.hin.memox.R
 import cool.hin.memox.data.model.Reminder
 import cool.hin.memox.data.model.Repetition
 import cool.hin.memox.data.model.RepetitionTimeUnit
+import cool.hin.memox.data.model.nextRepetition
 import cool.hin.memox.data.model.toCalendar
-import cool.hin.memox.data.model.toText
 import cool.hin.memox.databinding.ActivityRemindersBinding
 import cool.hin.memox.databinding.DialogReminderCustomRepetitionBinding
 import cool.hin.memox.databinding.DialogReminderRepetitionBinding
@@ -41,9 +41,12 @@ import cool.hin.memox.presentation.view.main.reminder.ReminderAdapter
 import cool.hin.memox.presentation.view.main.reminder.ReminderListener
 import cool.hin.memox.presentation.viewmodel.MemoXModel
 import cool.hin.memox.utils.canScheduleAlarms
+import cool.hin.memox.data.model.toText
+import cool.hin.memox.presentation.showToast
 import cool.hin.memox.utils.now
 import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.launch
 
@@ -159,8 +162,50 @@ class RemindersActivity : LockedActivity<ActivityRemindersBinding>(), ReminderLi
         binding.Toolbar.apply {
             setNavigationOnClickListener { finish() }
             menu.add(R.string.add_reminder, R.drawable.add) { showDatePickerDialog() }
+            menu.add(R.string.add_to_calendar, R.drawable.calendar_add_on) { addToCalendar() }
         }
     }
+
+    private fun addToCalendar() {
+        val reminders = model.reminders.value.orEmpty()
+        if (reminders.isEmpty()) return
+        val formatter = java.text.SimpleDateFormat.getDateTimeInstance()
+        val labels = reminders.map { formatter.format(calendarStart(it)) }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.add_to_calendar)
+            .setItems(labels.toTypedArray()) { _, which ->
+                val start = calendarStart(reminders[which])
+                val intent =
+                    Intent(Intent.ACTION_INSERT)
+                        .setData(android.provider.CalendarContract.Events.CONTENT_URI)
+                        .putExtra(
+                            android.provider.CalendarContract.Events.TITLE,
+                            getString(R.string.app_name),
+                        )
+                        .putExtra(android.provider.CalendarContract.EXTRA_EVENT_BEGIN_TIME, start.time)
+                        .putExtra(
+                            android.provider.CalendarContract.EXTRA_EVENT_END_TIME,
+                            start.time + 60 * 60 * 1000,
+                        )
+                // No resolveActivity pre-check: with targetSdk 30+ package visibility it returns
+                // null even when a calendar handler exists, falsely rejecting valid exports.
+                // startActivity itself throws ActivityNotFoundException when nothing can handle it.
+                try {
+                    startActivity(intent)
+                } catch (_: android.content.ActivityNotFoundException) {
+                    showToast(R.string.calendar_app_unavailable)
+                }
+            }
+            .show()
+    }
+
+    /**
+     * 重复提醒的 dateTime 是首次触发时间；导入日历时应使用下一次触发时间，
+     * 否则会导出一个早已过去的一次性事件。
+     */
+    private fun calendarStart(reminder: Reminder): Date =
+        reminder.nextRepetition(cool.hin.memox.utils.now().time) ?: reminder.dateTime
+
 
     private fun setupRecyclerView() {
         reminderAdapter =
