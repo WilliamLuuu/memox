@@ -10,6 +10,8 @@ import android.view.View
 import androidx.annotation.RequiresApi
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.asFlow
+import androidx.lifecycle.asLiveData
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.Observer
@@ -61,6 +63,7 @@ import cool.hin.memox.presentation.viewmodel.progress.ExportNotesProgress
 import cool.hin.memox.utils.ActionMode
 import cool.hin.memox.utils.Cache
 import cool.hin.memox.utils.MIME_TYPE_JSON
+import cool.hin.memox.utils.resolveAttachmentFile
 import cool.hin.memox.utils.backup.copyDatabase
 import cool.hin.memox.utils.backup.exportAsZip
 import cool.hin.memox.utils.backup.exportPdfFile
@@ -94,6 +97,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
+
+/** Applies label rename/removal to the saved home filter; null clears the matching dimension. */
+fun BaseNoteModel.HomeFilter.withLabelChange(old: String, new: String?): BaseNoteModel.HomeFilter =
+    if (label == old) copy(label = new) else this
+
+/** Applies folder rename/removal to the saved home filter; null clears the matching dimension. */
+fun BaseNoteModel.HomeFilter.withFolderChange(old: String, new: String?): BaseNoteModel.HomeFilter =
+    if (folderId == old) copy(folderId = new) else this
+
+/** Whether a note timestamp falls in the half-open [from, to) filter range. */
+internal fun matchesDateRange(timestamp: Long, from: Long?, to: Long?): Boolean =
+    (from == null || timestamp >= from) && (to == null || timestamp < to)
 
 class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
 
@@ -115,20 +132,44 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
     private var allNotesObserver: Observer<List<BaseNote>>? = null
     var baseNotes: Content? = Content(MutableLiveData(), ::transform)
     var deletedNotes: Content? = Content(MutableLiveData(), ::transform)
-    var archivedNotes: Content? = null
+    var archivedNotes: Content? = Content(MutableLiveData(), ::transform)
     var reminderNotes: Content? = Content(MutableLiveData(), ::transform)
 
     val folder = NotNullLiveData(Folder.NOTES)
 
+
+    data class HomeFilter(
+        val from: Long? = null,
+        val to: Long? = null,
+        val label: String? = null,
+        val folderId: String? = null,
+    )
+
+    private val homeFilter = MutableStateFlow(HomeFilter())
+
+    fun setHomeFilter(filter: HomeFilter) {
+        homeFilter.value = filter
+    }
+
+    fun currentHomeFilter(): HomeFilter = homeFilter.value
     var currentLabel: String? = CURRENT_LABEL_EMPTY
+
+    var searchFrom: Long? = null
+    var searchTo: Long? = null
 
     var keyword = String()
         set(value) {
             if (field != value || searchResults?.value?.isEmpty() == true) {
                 field = value
-                searchResults?.fetch(keyword, folder.value, currentLabel)
+                searchResults?.fetch(keyword, folder.value, currentLabel, searchFrom, searchTo)
             }
         }
+
+    fun setSearchDateRange(from: Long?, to: Long?) {
+        searchFrom = from
+        searchTo = to
+        searchResults?.fetch(keyword, folder.value, currentLabel, from, to)
+    }
 
     var searchResults: SearchResult? = null
 
@@ -151,7 +192,7 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
     fun startObserving() {
         MemoXDatabase.getDatabase(app).observeForever(::init)
         folder.observeForever { newFolder ->
-            searchResults?.fetch(keyword, newFolder, currentLabel)
+            searchResults?.fetch(keyword, newFolder, currentLabel, searchFrom, searchTo)
         }
     }
 
@@ -171,20 +212,10 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
         allNotes = baseNoteDao.getAllAsync()
         allNotes!!.observeForever(allNotesObserver!!)
 
-        labelsHiddenObserver?.let { preferences.labelsHidden.removeObserver(it) }
-        labelsHiddenObserver = Observer {
-            // Do NOT reassign `baseNotes` here: NotesFragment observes the existing
-            // Content instance (model.baseNotes!!). Recreating it would orphan the
-            // observed instance, so changes triggered by a background sync would not
-            // reach the home list until the fragment is recreated.
-            initBaseNotes()
-        }
-        preferences.labelsHidden.observeForever(labelsHiddenObserver!!)
-
-        foldersHiddenObserver?.let { preferences.foldersHidden.removeObserver(it) }
-        foldersHiddenObserver = Observer { initBaseNotes() }
-        preferences.foldersHidden.observeForever(foldersHiddenObserver!!)
-
+        // Initialise deferred data sources BEFORE registering preference observers. Those
+        // observers call initBaseNotes() synchronously on registration; if that path throws,
+        // initializing these afterwards would leave archived/deleted/reminder notes null and
+        // crash the corresponding pages with a `!!` in getObservable().
         if (deletedNotes == null) {
             deletedNotes = Content(baseNoteDao.getFrom(Folder.DELETED), ::transform)
         } else {
@@ -210,21 +241,38 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
         }
         // 初始拉取，防止 init 之前设置的 keyword 因 searchResults 尚未就绪而丢失
         if (keyword.isNotEmpty()) {
-            searchResults?.fetch(keyword, folder.value, currentLabel)
+            searchResults?.fetch(keyword, folder.value, currentLabel, searchFrom, searchTo)
         }
+
+        labelsHiddenObserver?.let { preferences.labelsHidden.removeObserver(it) }
+        labelsHiddenObserver = Observer {
+            // Do NOT reassign `baseNotes` here: NotesFragment observes the existing
+            // Content instance (model.baseNotes!!). Recreating it would orphan the
+            // observed instance, so changes triggered by a background sync would not
+            // reach the home list until the fragment is recreated.
+            initBaseNotes()
+        }
+        preferences.labelsHidden.observeForever(labelsHiddenObserver!!)
+
+        foldersHiddenObserver?.let { preferences.foldersHidden.removeObserver(it) }
+        foldersHiddenObserver = Observer { initBaseNotes() }
+        preferences.foldersHidden.observeForever(foldersHiddenObserver!!)
     }
 
     private fun initBaseNotes() {
         val labelsHidden = preferences.labelsHidden.value
         val foldersHidden = preferences.foldersHidden.value
         val overviewNotes =
-            baseNoteDao.getFrom(Folder.NOTES).map { list ->
+            baseNoteDao.getFrom(Folder.NOTES).asFlow().combine(homeFilter) { list, filter ->
                 list.filter { baseNote ->
                     baseNote.labels.none { labelsHidden.contains(it) } &&
                         (baseNote.folderId.isEmpty() ||
-                            !foldersHidden.contains(baseNote.folderId))
+                            !foldersHidden.contains(baseNote.folderId)) &&
+                        matchesDateRange(baseNote.timestamp, filter.from, filter.to) &&
+                        (filter.label == null || baseNote.labels.contains(filter.label)) &&
+                        (filter.folderId == null || baseNote.folderId == filter.folderId)
                 }
-            }
+            }.asLiveData(viewModelScope.coroutineContext + Dispatchers.IO, timeoutInMs = Long.MAX_VALUE)
         if (baseNotes == null) {
             baseNotes = Content(overviewNotes, ::transform)
         } else {
@@ -480,20 +528,50 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
         return if (dot >= 0) original.substring(0, dot) + "." + newExt else "$original.$newExt"
     }
 
-    fun exportBackup(uri: Uri, onComplete: (() -> Unit)? = null) {
+    fun exportBackup(
+        uri: Uri,
+        password: String =
+            cool.hin.memox.presentation.viewmodel.preference.Constants.PASSWORD_EMPTY,
+        onComplete: (() -> Unit)? = null,
+    ) {
         viewModelScope.launch {
             val exportedNotesAndAttachments =
                 withContext(Dispatchers.IO) {
                     app.log(TAG, msg = "Exporting backup to '$uri'...")
                     return@withContext app.exportAsZip(
                             uri,
-                            password = preferences.backupPassword.value,
+                            password = password,
                             backupProgress = progress,
                         )
                         .also { app.log(TAG, msg = "Finished exporting backup to '$uri'") }
                 }
 
             app.showToast(app.exportedText(exportedNotesAndAttachments))
+            onComplete?.invoke()
+        }
+    }
+
+    fun exportJex(uri: Uri, onComplete: (() -> Unit)? = null) {
+        viewModelScope.launch {
+            val result =
+                withContext(Dispatchers.IO) {
+                    val notes =
+                        MemoXDatabase.getDatabase(app, observePreferences = false)
+                            .value
+                            .getBaseNoteDao()
+                            .getAllForSync()
+                    val built =
+                        cool.hin.memox.data.imports.joplin.JexExporter.build(notes) {
+                            subfolder,
+                            name ->
+                            app.resolveAttachmentFile(subfolder, name)
+                                ?.takeIf { !it.absolutePath.contains("note-protected-cache") }
+                                ?.readBytes()
+                        }
+                    app.contentResolver.openOutputStream(uri)?.use { it.write(built.archive) }
+                    built
+                }
+            app.showToast(app.getString(R.string.jex_exported, result.exported, result.skippedEncrypted))
             onComplete?.invoke()
         }
     }
@@ -875,7 +953,10 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
     suspend fun getAllFolders() = withContext(Dispatchers.IO) { folderDao.getArrayOfAll() }
 
     fun deleteLabel(value: String) {
-        viewModelScope.launch(Dispatchers.IO) { commonDao.deleteLabel(value) }
+        viewModelScope.launch(Dispatchers.IO) {
+            commonDao.deleteLabel(value)
+            homeFilter.value = homeFilter.value.withLabelChange(value, null)
+        }
         val labelsHiddenPreference = preferences.labelsHidden
         val labelsHidden = labelsHiddenPreference.value.toMutableSet()
         if (labelsHidden.contains(value)) {
@@ -903,7 +984,10 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
 
     fun updateLabel(oldValue: String, newValue: String, onComplete: (success: Boolean) -> Unit) {
         executeAsyncWithCallback({ commonDao.updateLabel(oldValue, newValue) }) { success ->
-            if (success) SyncRouter.syncNow(getApplication())
+            if (success) {
+                homeFilter.value = homeFilter.value.withLabelChange(oldValue, newValue)
+                SyncRouter.syncNow(getApplication())
+            }
             onComplete(success)
         }
         val labelsHiddenPreference = preferences.labelsHidden
@@ -921,7 +1005,10 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
      * via note sync, so trigger a sync here.
      */
     fun deleteFolder(name: String) {
-        viewModelScope.launch(Dispatchers.IO) { commonDao.deleteFolder(name) }
+        viewModelScope.launch(Dispatchers.IO) {
+            commonDao.deleteFolder(name)
+            homeFilter.value = homeFilter.value.withFolderChange(name, null)
+        }
         val foldersHiddenPreference = preferences.foldersHidden
         val foldersHidden = foldersHiddenPreference.value.toMutableSet()
         if (foldersHidden.contains(name)) {
@@ -945,7 +1032,10 @@ class BaseNoteModel(private val app: Application) : AndroidViewModel(app) {
 
     fun updateFolder(oldName: String, newName: String, onComplete: (success: Boolean) -> Unit) {
         executeAsyncWithCallback({ commonDao.updateFolder(oldName, newName) }) { success ->
-            if (success) SyncRouter.syncNow(getApplication())
+            if (success) {
+                homeFilter.value = homeFilter.value.withFolderChange(oldName, newName)
+                SyncRouter.syncNow(getApplication())
+            }
             onComplete(success)
         }
         val foldersHiddenPreference = preferences.foldersHidden

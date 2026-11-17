@@ -6,6 +6,7 @@ import android.view.Menu
 import android.view.MenuInflater
 import android.view.View
 import android.view.ViewGroup
+import androidx.core.view.updatePadding
 import androidx.core.view.isVisible
 import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
@@ -54,6 +55,13 @@ class FoldersFragment : Fragment(), FolderListener {
             binding?.ImageView?.setImageResource(R.drawable.folder)
             setupItemTouchHelper(this)
         }
+
+        binding?.ListFab?.isVisible = true
+        binding?.ListFab?.setOnClickListener { displayAddFolderDialog() }
+        // initListView 会清零 padding；给 FAB 预留空间，避免末行按钮被遮挡。
+        binding?.MainListView?.updatePadding(
+            bottom = requireContext().resources.getDimensionPixelSize(R.dimen.list_fab_bottom_space),
+        )
 
         setupObserver()
     }

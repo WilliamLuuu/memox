@@ -28,6 +28,15 @@
                 android:gravity="center_vertical"
                 android:paddingStart="4dp"
                 android:paddingEnd="4dp">
+                <ImageButton
+                    android:id="@+id/HomeSearchButton"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:layout_marginEnd="4dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/search"
+                    android:tint="?attr/colorOnSurfaceVariant"
+                    app:srcCompat="@drawable/search" />
 
                 <!-- 弹性占位：把右侧 HomeBar/SearchPill/Avatar 整体推到 toolbar 最右。
                      搜索时设为 GONE，让 SearchPill weight=1 占满剩余宽度（否则 Space 与 SearchPill
@@ -45,6 +54,17 @@
                     android:layout_height="match_parent"
                     android:orientation="horizontal"
                     android:gravity="center_vertical|end">
+
+
+                    <ImageButton
+                        android:id="@+id/HomeFilterButton"
+                        android:layout_width="40dp"
+                        android:layout_height="40dp"
+                        android:visibility="gone"
+                        android:background="?attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="@string/filter"
+                        android:tint="?attr/colorOnSurfaceVariant"
+                        app:srcCompat="@drawable/filter_list" />
 
                     <ImageButton
                         android:id="@+id/HomeViewToggleButton"
@@ -138,16 +158,6 @@
 
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
-
-                <ImageButton
-                    android:id="@+id/AvatarButton"
-                    android:layout_width="40dp"
-                    android:layout_height="40dp"
-                    android:layout_marginStart="8dp"
-                    android:background="?attr/selectableItemBackgroundBorderless"
-                    android:contentDescription="@string/settings"
-                    android:tint="?attr/colorOnSurfaceVariant"
-                    app:srcCompat="@drawable/account_circle" />
 
             </LinearLayout>
 

@@ -43,6 +43,7 @@ data class BaseNoteVHPreferences(
     val textSize: Float,
     val hideLabels: Boolean,
     val sortedBy: NotesSortBy,
+    val markdownInList: Boolean = false,
 )
 
 class BaseNoteVH(
@@ -195,6 +196,22 @@ class BaseNoteVH(
             binding.Note.visibility = GONE
             return
         }
+        if (preferences.markdownInList &&
+            baseNote.contentFormat == cool.hin.memox.data.model.ContentFormat.MARKDOWN &&
+            keyword.isBlank()
+        ) {
+            binding.Note.apply {
+                // The overview shows four lines; parsing the whole note on the UI thread would
+                // stall long documents for no visible benefit.
+                text =
+                    cool.hin.memox.presentation.markdown.MarkdownRenderer.render(
+                        baseNote.body.take(600)
+                    )
+                maxLines = 4
+                isVisible = baseNote.body.isNotEmpty()
+            }
+            return
+        }
         if (keyword.isBlank()) {
             bindNote(baseNote.body, baseNote.spans, baseNote.title.isEmpty())
             return
@@ -234,6 +251,19 @@ class BaseNoteVH(
             Message.visibility = GONE
             ImageViewMore.visibility = GONE
             NoteThumbnail.visibility = GONE
+            // In grid the card is narrow: a 64dp lock would squeeze the date into an ellipsis.
+            val thumbnailLp =
+                NoteThumbnail.layoutParams
+                    as androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
+            val lockSize = if (isGrid) 24.dp else 64.dp
+            thumbnailLp.width = lockSize
+            thumbnailLp.height = lockSize
+            thumbnailLp.marginEnd = if (isGrid) 8.dp else 16.dp
+            // Grid cards are short: anchor the lock to the title row so it can never span the
+            // date/label rows and cover the creation time.
+            thumbnailLp.bottomToBottom = if (isGrid) R.id.Title else R.id.Note
+            thumbnailLp.topToTop = R.id.Title
+            NoteThumbnail.layoutParams = thumbnailLp
             Glide.with(NoteThumbnail.context).clear(NoteThumbnail)
             Glide.with(ImageView.context).clear(ImageView)
             ImageView.visibility = GONE
@@ -359,7 +389,13 @@ class BaseNoteVH(
                 if (baseNote.locked) {
                     // Locked notes hide their body/list; show a lock icon in the thumbnail slot.
                     NoteThumbnail.scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-                    NoteThumbnail.setPadding(8.dp, 8.dp, 8.dp, 8.dp)
+                    // 24dp 网格容器若再留 8dp 四边 padding 只剩 8×8dp 可绘制区域；
+                    // 列表仍是 64dp 容器，保留原有 padding。
+                    if (isGrid) {
+                        NoteThumbnail.setPadding(0, 0, 0, 0)
+                    } else {
+                        NoteThumbnail.setPadding(8.dp, 8.dp, 8.dp, 8.dp)
+                    }
                     NoteThumbnail.setImageResource(R.drawable.lock_big)
                     NoteThumbnail.visibility = VISIBLE
                 }

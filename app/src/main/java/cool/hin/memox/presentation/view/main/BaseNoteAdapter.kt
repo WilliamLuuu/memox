@@ -36,6 +36,7 @@ class BaseNoteAdapter(
     private var attachedRecyclerView: RecyclerView? = null
 
     private var list = SortedList(Item::class.java, notesSortCallback(this))
+    private var lastSubmitted: List<Item>? = null
 
     override fun getItemViewType(position: Int): Int {
         return when (list[position]) {
@@ -170,6 +171,11 @@ class BaseNoteAdapter(
         get() = list.toList()
 
     fun submitList(items: List<Item>) {
+        // LiveData replays its cached value when a page is revisited. Avoid a full SortedList
+        // rebuild (and the resulting main-thread churn) when the exact same list instance comes
+        // back — this is the common case when switching between large pages.
+        if (items === lastSubmitted) return
+        lastSubmitted = items
         list.replaceAll(items)
     }
 

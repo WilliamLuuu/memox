@@ -1,7 +1,9 @@
 package cool.hin.memox.presentation.activity.main
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -13,6 +15,8 @@ import android.widget.PopupMenu
 import android.view.ViewGroup
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.OvershootInterpolator
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
@@ -30,12 +34,14 @@ import androidx.navigation.ui.AppBarConfiguration
 import androidx.navigation.ui.NavigationUI
 import androidx.navigation.ui.setupWithNavController
 import androidx.appcompat.app.ActionBarDrawerToggle
+import androidx.appcompat.view.menu.MenuBuilder
 import androidx.core.view.GravityCompat
 import com.bumptech.glide.Glide
 import com.bumptech.glide.signature.ObjectKey
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.transition.platform.MaterialFade
 import cool.hin.memox.presentation.activity.main.fragment.SearchFragment
+import cool.hin.memox.presentation.activity.main.fragment.settings.SettingsFragment
 import cool.hin.memox.presentation.viewmodel.preference.NotesSort
 import cool.hin.memox.presentation.viewmodel.preference.NotesSortBy
 import cool.hin.memox.presentation.viewmodel.preference.NotesView
@@ -54,6 +60,7 @@ import cool.hin.memox.presentation.activity.note.EditNoteActivity
 import cool.hin.memox.presentation.activity.note.NoteActionHandler
 import cool.hin.memox.presentation.activity.note.handleRejection
 import cool.hin.memox.presentation.dp
+import cool.hin.memox.presentation.hideKeyboard
 import cool.hin.memox.presentation.showKeyboard
 import cool.hin.memox.presentation.setupProgressDialog
 import cool.hin.memox.presentation.viewmodel.BaseNoteModel
@@ -80,6 +87,36 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
 
     private var isStartViewFragment = false
 
+    private var lastToolbarTapAt = 0L
+
+    private fun currentListFragment(): androidx.fragment.app.Fragment? {
+        val navHost =
+            supportFragmentManager.findFragmentById(R.id.NavHostFragment) ?: return null
+        return navHost.childFragmentManager.primaryNavigationFragment
+    }
+
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+            val toolbar = binding.Toolbar
+            val location = IntArray(2).also { toolbar.getLocationOnScreen(it) }
+            val inside =
+                ev.rawX >= location[0] &&
+                    ev.rawX <= location[0] + toolbar.width &&
+                    ev.rawY >= location[1] &&
+                    ev.rawY <= location[1] + toolbar.height
+            if (inside) {
+                val now = System.currentTimeMillis()
+                if (now - lastToolbarTapAt < 300) {
+                    lastToolbarTapAt = 0
+                    (currentListFragment() as? ScrollToTop)?.scrollToTop()
+                } else {
+                    lastToolbarTapAt = now
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     private val topLevelDestinations = setOf(
         R.id.Notes,
         R.id.Reminders,
@@ -100,12 +137,42 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
             }
         }
 
+    /**
+     * 搜索栏可见时用 overlay 优先级的 back 回调，抢在输入法之前消费返回键。
+     *
+     * 输入法窗口持有焦点时，第一次返回只会收起键盘，Activity 的 OnBackPressedCallback
+     * 根本不会触发，导致“退出搜索要按两次”。overlay 回调在 API 33+ 上先于 IME 收到
+     * back，因此一次即可退出搜索页/收起搜索栏。
+     */
+    private val searchBackCallback: OnBackInvokedCallback? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            OnBackInvokedCallback {
+                if (baseModel.actionMode.enabled.value) {
+                    baseModel.actionMode.close(true)
+                    return@OnBackInvokedCallback
+                }
+                handleSearchBack()
+            }
+        } else {
+            null
+        }
+    private var searchBackRegistered = false
+
     var getCurrentFragmentNotes: (() -> Collection<BaseNote>?)? = null
 
     override fun onSupportNavigateUp(): Boolean {
-        baseModel.keyword = ""
+        // 与返回键一致：从笔记页进入且 Notes 已弹出时，Up 必须结束本任务，
+        // 不能走 Navigation 的 deep-link Up 分支重新启动首页。
+        if (shouldFinishOnUp()) {
+            finish()
+            return true
+        }
         return NavigationUI.navigateUp(navController, configuration)
     }
+
+    private fun shouldFinishOnUp(): Boolean =
+        intent.getBooleanExtra(EXTRA_SKIP_START_VIEW_ON_BACK, false) &&
+            navController.previousBackStackEntry == null
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -135,17 +202,25 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
         setContentView(binding.root)
         setSupportActionBar(binding.Toolbar)
         configureEdgeToEdgeInsets()
-
+        cool.hin.memox.data.security.PendingContextHolder.context = application
+        if (!preferences.isLockEnabled) {
+            cool.hin.memox.data.security.SecuritySession.markNoLockConfigured()
+        }
         setupFAB()
         setupActionMode()
         setupNavigation()
+        restorePendingSettingsDestination()
         setupUpdateCheck()
         setupToolbar()
         setupSyncIsland()
-
         setupActivityResultLaunchers()
 
+        // 启动数据观察（Room/偏好/搜索）并执行必要的历史数据迁移；必须在页面观察数据前调用。
         checkForMigrations(savedInstanceState)
+
+
+        // 旋转重建后重新绑定可能存活的日期选择器监听器（FragmentManager 不恢复监听器）。
+        restoreDateRangePicker()
 
         // Sync with the active provider on app start (pull remote updates)
         SyncRouter.syncNow(this)
@@ -160,13 +235,7 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
                     if (baseModel.actionMode.enabled.value) {
                         return
                     }
-                    // 下拉呼出的搜索框（尚未进入 Search 页面）优先收起
-                    if (binding.SearchPill.visibility == View.VISIBLE &&
-                        navController.currentDestination?.id != R.id.Search
-                    ) {
-                        hideSearchBar()
-                        return
-                    }
+                    if (handleSearchBack()) return
                     // Let Navigation handle back first (e.g. Settings sub-page -> Settings root)
                     if (navController.previousBackStackEntry != null) {
                         navController.popBackStack()
@@ -215,7 +284,19 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
             baseModel.startObserving()
             val fragmentIdToLoad = intent.getIntExtra(EXTRA_FRAGMENT_TO_OPEN, -1)
             if (fragmentIdToLoad != -1) {
-                navController.navigate(fragmentIdToLoad, intent.extras)
+                val skipStartViewOnBack =
+                    intent.getBooleanExtra(EXTRA_SKIP_START_VIEW_ON_BACK, false)
+                navController.navigate(
+                    fragmentIdToLoad,
+                    intent.extras,
+                    navOptions {
+                        // 从笔记页点标签进入时，返回应结束 MainActivity 回到原笔记，
+                        // 不能先回退到 Navigation 的起始首页。
+                        if (skipStartViewOnBack) {
+                            popUpTo(R.id.Notes) { inclusive = true }
+                        }
+                    },
+                )
             } else if (savedInstanceState == null) {
                 navigateToStartView()
             }
@@ -336,7 +417,9 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
             actionModeCancelCallback.isEnabled = enabled
         }
 
+        @SuppressLint("RestrictedApi")
         val menu = binding.ActionMode.menu
+        (menu as? MenuBuilder)?.setOptionalIconsVisible(true)
         baseModel.folder.observe(this@MainActivity, ModelFolderObserver(this, menu, baseModel))
         baseModel.actionMode.loading.observe(this@MainActivity) { loading ->
             menu.setGroupEnabled(Menu.NONE, !loading)
@@ -410,6 +493,16 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
         )
     }
 
+    private fun restorePendingSettingsDestination() {
+        val destinationId = SettingsFragment.pendingDestinationId ?: return
+        SettingsFragment.pendingDestinationId = null
+        binding.NavHostFragment.post {
+            if (navController.currentDestination?.id != destinationId) {
+                navController.navigate(destinationId)
+            }
+        }
+    }
+
     private fun setupNavigation() {
         val navHostFragment =
             supportFragmentManager.findFragmentById(R.id.NavHostFragment) as NavHostFragment
@@ -450,7 +543,9 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
             }
 
             toggle.setToolbarNavigationClickListener {
-                if (destination.id in topLevelDestinations) {
+                if (shouldFinishOnUp()) {
+                    finish()
+                } else if (destination.id in topLevelDestinations) {
                     binding.DrawerLayout.openDrawer(GravityCompat.START)
                 } else {
                     NavigationUI.navigateUp(navController, configuration)
@@ -475,20 +570,33 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
                 }
             }
             when (destination.id) {
-                R.id.Notes,
-                R.id.DisplayLabel,
-                R.id.DisplayFolder -> {
+
+                R.id.Notes -> {
                     binding.TakeNote.show()
                     // #1: 视图/排序按钮只跟首页 Notes/DisplayLabel/DisplayFolder 共用一个顶部 Toolbar
                     // 显示；其余顶层（Settings/About/Reminders/Archive/Labels/Folders/Deleted）都不显示
                     if (!isSearchBarVisible()) {
                         binding.HomeBar.visibility = View.VISIBLE
                     }
+                    // 筛选只作用于首页 baseNotes；DisplayLabel/DisplayFolder 的数据源不消费它。
+                    binding.HomeFilterButton.visibility = View.VISIBLE
+                }
+                R.id.DisplayLabel, R.id.DisplayFolder -> {
+                    binding.TakeNote.show()
+                    if (!isSearchBarVisible()) {
+                        binding.HomeBar.visibility = View.VISIBLE
+                    }
+                    binding.HomeFilterButton.visibility = View.GONE
+                }
+                R.id.Labels, R.id.Folders -> {
+                    binding.TakeNote.hide()
+                    binding.HomeBar.visibility = View.GONE
+                    binding.HomeFilterButton.visibility = View.GONE
                 }
                 else -> {
                     binding.TakeNote.hide()
-                    // 非首页：隐藏视图/排序按钮，避免 About/Settings 等页面误显
                     binding.HomeBar.visibility = View.GONE
+                    binding.HomeFilterButton.visibility = View.GONE
                 }
             }
             isStartViewFragment = isStartViewFragment(destination.id, bundle)
@@ -526,7 +634,11 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
         val sortButton = binding.SortButton
         val homeViewToggle = binding.HomeViewToggleButton
         val homeSort = binding.HomeSortButton
-        val avatar = binding.AvatarButton
+
+        binding.HomeSearchButton.setOnClickListener {
+            if (isSearchBarVisible()) hideSearchBar() else showSearchBar()
+        }
+        binding.HomeFilterButton.setOnClickListener { showHomeFilterDialog() }
 
         restoringSearchText = true
         searchEditText.setText(baseModel.keyword)
@@ -584,72 +696,132 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
         homeSort.setOnClickListener(onSortClick)
         updateSortIcon()
 
-        avatar.setOnClickListener {
-            AccountSheetDialog().show(supportFragmentManager, AccountSheetDialog.TAG)
-        }
+    }
 
-        baseModel.preferences.onedriveSyncEnabled.observe(this) { enabled ->
-            updateAvatar(enabled)
-        }
+    private fun showHomeFilterDialog() {
+        val filter = baseModel.currentHomeFilter()
+        val options =
+            arrayOf(
+                getString(R.string.date_range),
+                getString(R.string.filter_label),
+                getString(R.string.filter_folder),
+                getString(R.string.filter_clear),
+            )
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.filter)
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> pickFilterDateRange(filter)
+                    1 -> pickFilterLabel(filter)
+                    2 -> pickFilterFolder(filter)
+                    else -> baseModel.setHomeFilter(BaseNoteModel.HomeFilter())
+                }
+            }
+            .show()
+    }
+
+    private fun pickFilterDateRange(current: BaseNoteModel.HomeFilter) {
+        val picker =
+            com.google.android.material.datepicker.MaterialDatePicker.Builder.dateRangePicker()
+                .setTitleText(R.string.date_range)
+                .build()
+        bindDateRangePicker(picker, current)
+        picker.show(supportFragmentManager, HOME_FILTER_DATE_PICKER_TAG)
     }
 
     /**
-     * Shows the Microsoft account picture once OneDrive is connected, falling back to the tinted
-     * default icon. If the picture has not been cached yet it is downloaded in the background.
+     * FragmentManager 会在旋转后重建 MaterialDatePicker，但监听器不会随 Fragment 状态恢复。
+     * 每次 onCreate 后按 tag 找回仍存活的 picker 并重新绑定，避免确认后筛选不生效。
      */
-    private fun updateAvatar(onedriveEnabled: Boolean) {
-        val avatar = binding.AvatarButton
-        val photo = if (onedriveEnabled) OneDriveAuthHelper.getAvatarFile(this) else null
-        if (photo != null) {
-            avatar.clearColorFilter()
-            avatar.imageTintList = null
-            Glide.with(this)
-                .load(photo)
-                .signature(ObjectKey(photo.lastModified()))
-                .circleCrop()
-                .placeholder(R.drawable.account_circle)
-                .into(avatar)
-            return
-        }
+    private fun restoreDateRangePicker() {
+        (supportFragmentManager.findFragmentByTag(HOME_FILTER_DATE_PICKER_TAG)
+            as? com.google.android.material.datepicker.MaterialDatePicker<androidx.core.util.Pair<Long, Long>>)
+            ?.let { bindDateRangePicker(it, baseModel.currentHomeFilter()) }
+    }
 
-        Glide.with(this).clear(avatar)
-        avatar.setImageResource(R.drawable.account_circle)
-        val color =
-            if (onedriveEnabled) {
-                MaterialColors.getColor(this, com.google.android.material.R.attr.colorPrimary, 0)
-            } else {
-                MaterialColors.getColor(
-                    this,
-                    com.google.android.material.R.attr.colorOnSurfaceVariant,
-                    0,
+    private fun bindDateRangePicker(
+        picker: com.google.android.material.datepicker.MaterialDatePicker<androidx.core.util.Pair<Long, Long>>,
+        current: BaseNoteModel.HomeFilter,
+    ) {
+        // MaterialDatePicker 返回 UTC 零点；重新绑定会覆盖旧监听器，不会重复应用筛选。
+        picker.addOnPositiveButtonClickListener { selection ->
+            baseModel.setHomeFilter(
+                current.copy(
+                    from = localStartOfDay(selection.first),
+                    to = exclusiveEndOfDay(selection.second, java.util.TimeZone.getDefault()),
                 )
-            }
-        avatar.setColorFilter(color)
-
-        if (onedriveEnabled) {
-            lifecycleScope.launch {
-                OneDriveAuthHelper.fetchAndStoreAvatar(this@MainActivity)
-                if (OneDriveAuthHelper.getAvatarFile(this@MainActivity) != null) {
-                    updateAvatar(true)
-                }
-            }
+            )
         }
     }
 
-    internal fun showSearchBar(clearText: Boolean = false) {
+    private fun pickFilterLabel(current: BaseNoteModel.HomeFilter) {
+        val values = baseModel.labels.value.orEmpty().map { it.value }
+        if (values.isEmpty()) return
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.filter_label)
+            .setItems(values.toTypedArray()) { _, which ->
+                baseModel.setHomeFilter(current.copy(label = values[which]))
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun pickFilterFolder(current: BaseNoteModel.HomeFilter) {
+        val values = baseModel.folders.value.orEmpty().map { it.name }
+        if (values.isEmpty()) return
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.filter_folder)
+            .setItems(values.toTypedArray()) { _, which ->
+                baseModel.setHomeFilter(current.copy(folderId = values[which]))
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * 搜索框可见时优先只收起键盘，保留搜索框和关键词；
+     * 键盘已收起时再按返回才会收起搜索框，但关键词仍保留在 [BaseNoteModel.keyword]。
+     */
+    private fun handleSearchBack(): Boolean {
+        if (!isSearchBarVisible()) return false
+        val imeVisible =
+            ViewCompat.getRootWindowInsets(binding.root)
+                ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+        if (imeVisible) {
+            hideKeyboard(binding.SearchEditText)
+            return true
+        }
+        if (navController.currentDestination?.id == R.id.Search) {
+            // 键盘已收起后的下一次返回才真正退出 Search；关键词仍保存在 model 里。
+            navController.popBackStack()
+            return true
+        }
+        hideSearchBar()
+        return true
+    }
+    internal fun showSearchBar() {
+        registerSearchBackCallback()
         if (binding.SearchPill.visibility != View.VISIBLE) {
             binding.SearchPill.visibility = View.VISIBLE
             binding.HomeBar.visibility = View.GONE
+            binding.HomeSearchButton.visibility = View.GONE
             // Space 与 SearchPill 都是 weight=1，会各占 1/2；
             // 搜索时让 Space 隐藏，SearchPill 自然占满剩余空间。
             binding.ToolbarSpacer.visibility = View.GONE
         }
-        if (clearText) {
-            // 手动下拉呼出搜索框时清空上次残留内容：关掉/返回后再拉出应为空白，而非旧文本
-            restoringSearchText = true
-            binding.SearchEditText.setText("")
-            baseModel.keyword = ""
-            restoringSearchText = false
+        // 重新打开搜索框时保留关键词，但必须同步进入 Search 页；
+        // 否则文字还留在搜索框里，列表却是未过滤的首页笔记，看起来像搜索结果错误。
+        if (
+            !binding.SearchEditText.text.isNullOrBlank() &&
+            navController.currentDestination?.id != R.id.Search
+        ) {
+            navController.navigate(
+                R.id.Search,
+                Bundle().apply {
+                    putSerializable(SearchFragment.EXTRA_INITIAL_FOLDER, baseModel.folder.value)
+                    putSerializable(SearchFragment.EXTRA_INITIAL_LABEL, baseModel.currentLabel)
+                },
+            )
         }
         // 进入/呼出搜索框时让输入框重新获得焦点并弹出键盘，
         // 避免搜索结果页接管后输入框丢失输入连接（键盘还挂着却无法输入，必须再点一次）。
@@ -660,12 +832,35 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
     }
 
     internal fun hideSearchBar() {
+        unregisterSearchBackCallback()
+        hideKeyboard(binding.SearchEditText)
         if (binding.SearchPill.visibility != View.GONE) {
             binding.SearchPill.visibility = View.GONE
-            binding.HomeBar.visibility = View.VISIBLE
+            // 目的地没有变化时不会触发导航监听，这里必须按当前目的地恢复 HomeBar。
+            val showHomeBar =
+                navController.currentDestination?.id in HOME_BAR_DESTINATIONS
+            binding.HomeBar.visibility = if (showHomeBar) View.VISIBLE else View.GONE
+            binding.HomeSearchButton.visibility = View.VISIBLE
             // 恢复 Space 把 HomeBar/Avatar 推回 toolbar 最右。
             binding.ToolbarSpacer.visibility = View.VISIBLE
         }
+    }
+
+    private fun registerSearchBackCallback() {
+        if (searchBackRegistered) return
+        val callback = searchBackCallback ?: return
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(
+            OnBackInvokedDispatcher.PRIORITY_OVERLAY,
+            callback,
+        )
+        searchBackRegistered = true
+    }
+
+    private fun unregisterSearchBackCallback() {
+        if (!searchBackRegistered) return
+        val callback = searchBackCallback ?: return
+        onBackInvokedDispatcher.unregisterOnBackInvokedCallback(callback)
+        searchBackRegistered = false
     }
 
     fun isSearchBarVisible(): Boolean = binding.SearchPill.visibility == View.VISIBLE
@@ -803,6 +998,48 @@ class MainActivity : LockedActivity<ActivityMainBinding>() {
         const val EXTRA_SKIP_START_VIEW_ON_BACK = "memox.intent.extra.SKIP_START_VIEW_ON_BACK"
         private const val ACTION_LABELS = 1001
         private const val ACTION_SETTINGS = 1002
+        private const val HOME_FILTER_DATE_PICKER_TAG = "home-filter-date"
+
+        private val HOME_BAR_DESTINATIONS =
+            setOf(R.id.Notes, R.id.DisplayLabel, R.id.DisplayFolder)
+        /**
+         * MaterialDatePicker 返回所选日期的 UTC 零点。先在 UTC 读出真正的年月日，
+         * 再在当地时区构造当天零点；直接在当地时区解析 UTC 零点会让负时区读成前一天。
+         * 与 [exclusiveEndOfDay] 的排他上界配套，覆盖结束日全天。
+         */
+        internal fun localStartOfDay(utcMidnight: Long): Long =
+            localStartOfDay(utcMidnight, java.util.TimeZone.getDefault())
+
+        /** 纯逻辑重载，便于 JVM 单测按固定时区验证边界。 */
+        internal fun localStartOfDay(utcMidnight: Long, timeZone: java.util.TimeZone): Long {
+            val utc =
+                java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
+                    timeInMillis = utcMidnight
+                }
+            return java.util.Calendar.getInstance(timeZone)
+                .apply {
+                    clear()
+                    set(
+                        utc.get(java.util.Calendar.YEAR),
+                        utc.get(java.util.Calendar.MONTH),
+                        utc.get(java.util.Calendar.DAY_OF_MONTH),
+                        0,
+                        0,
+                        0,
+                    )
+                }
+                .timeInMillis
+        }
+
+        /** 排他上界：结束日“下一天”的本地零点，因此结束日 23:59:59 仍落在范围内。 */
+        internal fun exclusiveEndOfDay(utcMidnight: Long, timeZone: java.util.TimeZone): Long =
+            java.util.Calendar.getInstance(timeZone)
+                .apply {
+                    timeInMillis = localStartOfDay(utcMidnight, timeZone)
+                    add(java.util.Calendar.DAY_OF_MONTH, 1)
+                }
+                .timeInMillis
+
         val ACTIVITES_WITHOUT_TOOLBAR_ICONS =
             setOf(
                 R.id.Settings,
