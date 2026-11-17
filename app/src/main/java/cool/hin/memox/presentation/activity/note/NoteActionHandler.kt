@@ -276,8 +276,78 @@ class NoteActionHandler(
                 return
             }
         }
-        notallyModel.locked = !notallyModel.locked
+        if (!notallyModel.locked) {
+            notallyModel.locked = true
+            notallyModel.protection = cool.hin.memox.data.model.NoteProtection.ENCRYPTED
+            askRecoveryPassword()
+        } else {
+            notallyModel.locked = false
+            if (notallyModel.payload != null) {
+                notallyModel.protection = cool.hin.memox.data.model.NoteProtection.NONE
+            }
+        }
         activity.bindPinned()
+    }
+
+    /**
+     * A recovery password is what allows opening an encrypted note on another device. It is
+     * optional locally but strongly recommended; it is never stored as plaintext.
+     */
+    private fun askRecoveryPassword() {
+        val density = activity.resources.displayMetrics.density
+        val container =
+            android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                val padding = (20 * density).toInt()
+                setPadding(padding, padding / 2, padding, 0)
+            }
+        fun passwordField(hintRes: Int) =
+            android.widget.EditText(activity).apply {
+                hint = activity.getString(hintRes)
+                inputType =
+                    android.text.InputType.TYPE_CLASS_TEXT or
+                        android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                setSingleLine()
+            }
+        val password = passwordField(R.string.note_recovery_password_hint)
+        val confirmation = passwordField(R.string.note_recovery_password_confirm_hint)
+        container.addView(password)
+        container.addView(confirmation)
+
+        val dialog =
+            MaterialAlertDialogBuilder(activity)
+                .setTitle(R.string.note_recovery_password_title)
+                .setMessage(R.string.note_recovery_password_message)
+                .setView(container)
+                .setPositiveButton(R.string.note_recovery_password_set, null)
+                .setNeutralButton(R.string.note_recovery_password_skip) { _, _ ->
+                    notallyModel.recoveryPassword = null
+                }
+                .setNegativeButton(android.R.string.cancel) { _, _ ->
+                    notallyModel.locked = false
+                    notallyModel.protection = cool.hin.memox.data.model.NoteProtection.NONE
+                    activity.bindPinned()
+                }
+                .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val first = password.text.toString()
+                val second = confirmation.text.toString()
+                when {
+                    first.isEmpty() ->
+                        confirmation.error =
+                            activity.getString(R.string.note_recovery_password_empty)
+                    first != second ->
+                        confirmation.error =
+                            activity.getString(R.string.note_recovery_password_mismatch)
+                    else -> {
+                        notallyModel.recoveryPassword = first.toCharArray()
+                        dialog.dismiss()
+                    }
+                }
+            }
+        }
+        dialog.show()
     }
 
     fun pinToStatus() {

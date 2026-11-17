@@ -23,6 +23,8 @@ import cool.hin.memox.presentation.view.main.label.SelectableLabelAdapter
 class SelectLabelsActivity : LockedActivity<ActivityLabelBinding>() {
 
     private lateinit var selectedLabels: ArrayList<String>
+    private lateinit var resultIntent: Intent
+    private lateinit var labelAdapter: SelectableLabelAdapter
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,9 +40,8 @@ class SelectLabelsActivity : LockedActivity<ActivityLabelBinding>() {
             )
         selectedLabels = savedList ?: passedList
 
-        val result = Intent()
-        result.putExtra(EXTRA_SELECTED_LABELS, selectedLabels)
-        setResult(RESULT_OK, result)
+        resultIntent = Intent().putExtra(EXTRA_SELECTED_LABELS, selectedLabels)
+        setResult(RESULT_OK, resultIntent)
 
         setupToolbar()
         setupRecyclerView()
@@ -108,6 +109,11 @@ class SelectLabelsActivity : LockedActivity<ActivityLabelBinding>() {
                 if (value.isNotEmpty()) {
                     baseModel.insertLabel(value) { success ->
                         if (success) {
+                            // 在标签选择页新建的标签默认勾选，表示已加入当前笔记。
+                            if (!selectedLabels.contains(value)) selectedLabels.add(value)
+                            resultIntent.putExtra(EXTRA_SELECTED_LABELS, selectedLabels)
+                            setResult(RESULT_OK, resultIntent)
+                            if (::labelAdapter.isInitialized) labelAdapter.notifyDataSetChanged()
                             dialog.dismiss()
                         } else showToast(R.string.label_exists)
                     }
@@ -117,7 +123,7 @@ class SelectLabelsActivity : LockedActivity<ActivityLabelBinding>() {
     }
 
     private fun setupRecyclerView() {
-        val labelAdapter = SelectableLabelAdapter(selectedLabels)
+        labelAdapter = SelectableLabelAdapter(selectedLabels)
         labelAdapter.onChecked = { position, checked ->
             if (position != -1) {
                 val label = labelAdapter.currentList[position]

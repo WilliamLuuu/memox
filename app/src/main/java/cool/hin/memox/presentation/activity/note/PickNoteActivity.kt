@@ -57,6 +57,7 @@ open class PickNoteActivity : LockedActivity<ActivityPickNoteBinding>(), ItemLis
                         textSizeOverview.value,
                         labelTagsHiddenInOverview.value,
                         notesSorting.value.sortedBy,
+                        markdownInList.value,
                     ),
                     application.getCurrentImagesDirectory(),
                     this@PickNoteActivity,
