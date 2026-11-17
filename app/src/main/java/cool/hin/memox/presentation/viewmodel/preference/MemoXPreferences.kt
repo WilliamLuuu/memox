@@ -30,7 +30,34 @@ class MemoXPreferences private constructor(private val context: Context) {
     }
 
     val theme = createEnumPreference(preferences, "theme", Theme.FOLLOW_SYSTEM, R.string.theme)
+    val themeColor =
+        createEnumPreference(preferences, "themeColor", ThemeColor.DEFAULT, R.string.theme_color)
     val useDynamicColors = BooleanPreference("useDynamicColors", preferences, false)
+
+    val savePolicy =
+        createEnumPreference(preferences, "savePolicy", SavePolicy.AUTO, R.string.save_policy)
+
+    val agentApiEnabled =
+        BooleanPreference("agentApiEnabled", preferences, false, R.string.agent_api_title)
+    val agentApiHost =
+        StringPreference(
+            "agentApiHost",
+            preferences,
+            "127.0.0.1",
+            R.string.agent_api_host,
+        )
+    // Lazy on purpose: touching EncryptedSharedPreferences is expensive and must not happen
+    // unless the Agent API is actually used.
+    val agentApiToken by lazy {
+        StringPreference("agentApiToken", encryptedPreferences, "", R.string.agent_api_token)
+    }
+    val markdownLivePreview =
+        BooleanPreference("markdownLivePreview", preferences, true, R.string.markdown_live_preview)
+    val markdownInList =
+        BooleanPreference("markdownInList", preferences, false, R.string.markdown_in_list)
+    /** 新建笔记默认使用 Markdown 源码还是富文本编辑器。 */
+    val markdownByDefault =
+        BooleanPreference("markdownByDefault", preferences, false, R.string.markdown_default_format)
     /** 链接是否以卡片形式展示（关闭则仅保留可点击的纯文本链接）。 */
     val linkCardEnabled =
         BooleanPreference("linkCardEnabled", preferences, true, R.string.link_card_title)
@@ -73,7 +100,7 @@ class MemoXPreferences private constructor(private val context: Context) {
         createEnumPreference(
             preferences,
             "dateFormat",
-            DateFormat.DD_MM_YY_GER,
+            DateFormat.SHORT_ISO,
             R.string.date_format,
         )
     val timeFormat =
@@ -365,6 +392,8 @@ class MemoXPreferences private constructor(private val context: Context) {
                 editNoteActivityTopActions,
                 editNoteActivityBottomAction,
                 defaultNoteColor,
+                markdownByDefault,
+                agentApiHost,
             )
             .forEach { it.refresh() }
     }

@@ -362,6 +362,24 @@ enum class Theme(override val textResId: Int) : StaticTextProvider {
     FOLLOW_SYSTEM(R.string.follow_system),
 }
 
+/** Accent presets. Surfaces stay on the default palette; only primary/secondary roles change. */
+enum class ThemeColor(
+    override val textResId: Int,
+    val colorResId: Int,
+) : StaticTextProvider {
+    DEFAULT(R.string.theme_color_default, R.color.md_theme_primary),
+    GREEN(R.string.theme_color_green, R.color.preset_green_primary),
+    BLUE(R.string.theme_color_blue, R.color.preset_blue_primary),
+    PURPLE(R.string.theme_color_purple, R.color.preset_purple_primary),
+    ORANGE(R.string.theme_color_orange, R.color.preset_orange_primary),
+}
+
+/** Mutually exclusive save behaviours; replaces two contradictory boolean switches. */
+enum class SavePolicy(override val textResId: Int) : StaticTextProvider {
+    AUTO(R.string.save_policy_auto),
+    ASK_ON_EXIT(R.string.save_policy_ask),
+}
+
 class ThreadLocalDateFormat(private val format: String, private val locale: Locale) {
     private val threadLocal =
         object : ThreadLocal<SimpleDateFormat>() {
@@ -430,6 +448,7 @@ enum class TimeFormat(val format: (Date) -> String) : TextProvider {
     override fun getText(context: Context): String {
         return when (this) {
             NONE -> context.getString(R.string.none)
+            TWENTY_FOUR_H -> context.getString(R.string.time_24h_label)
             else -> oneDayAgo().format(dateFormat = DateFormat.NONE, timeFormat = this)
         }
     }
