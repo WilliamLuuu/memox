@@ -1,0 +1,9 @@
+{
+  "name": "memox-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP stdio adapter for the memoX local Agent API",
+  "bin": { "memox-mcp": "./memox-mcp.mjs" },
+  "engines": { "node": ">=18" }
+}
