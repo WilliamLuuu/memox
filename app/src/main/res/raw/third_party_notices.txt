@@ -1,0 +1,46 @@
+memoX third-party notices
+
+Material Components for Android (com.google.android.material:material)
+Copyright Google LLC
+Licensed under the Apache License, Version 2.0
+https://github.com/material-components/material-components-android
+
+Material Symbols / Material Icons (icon shapes used by the app UI)
+Copyright Google LLC
+Licensed under the Apache License, Version 2.0
+https://fonts.google.com/icons
+
+AndroidX, Room, WorkManager, Biometric, SwipeRefreshLayout
+Copyright The Android Open Source Project
+Licensed under the Apache License, Version 2.0
+https://developer.android.com/jetpack/androidx
+
+OkHttp
+Copyright Square, Inc.
+Licensed under the Apache License, Version 2.0
+https://square.github.io/okhttp/
+
+zip4j
+Copyright Srikanth Reddy Lingala
+Licensed under the Apache License, Version 2.0
+https://github.com/srikanth-lingala/zip4j
+
+CommonMark Java and GFM extensions
+Copyright CommonMark contributors
+Licensed under the BSD 2-Clause License
+https://github.com/commonmark/commonmark-java
+
+SQLCipher for Android (Zetetic)
+Licensed under the Zetetic Community License / BSD-style terms
+https://www.zetetic.net/sqlcipher/license/
+
+Glide, ColorPickerView, PrettyTime, jsoup, Simple XML, zstd-jni, SwipeDrawer
+Licensed under their respective Apache-2.0 / BSD / MIT licenses; see the linked upstream
+projects in the app's dependency configuration (app/build.gradle.kts).
+
+Joplin JEX format
+The importer/exporter implements the documented JEX layout; no Joplin source code is copied.
+https://joplinapp.org/help/apps/import_export/
+
+The full Apache License 2.0 text is available at:
+https://www.apache.org/licenses/LICENSE-2.0

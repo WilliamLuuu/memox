@@ -34,21 +34,42 @@
                     style="@style/Preference"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="@string/appearance" />
+                    android:text="@string/settings_group_display" />
 
                 <TextView
-                    android:id="@+id/GoToBackup"
+                    android:id="@+id/GoToEditing"
                     style="@style/Preference"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="@string/backup" />
+                    android:text="@string/settings_group_editing" />
+
+                <TextView
+                    android:id="@+id/GoToSync"
+                    style="@style/Preference"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/settings_group_sync" />
+
+                <TextView
+                    android:id="@+id/GoToLists"
+                    style="@style/Preference"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/settings_group_lists" />
 
                 <TextView
                     android:id="@+id/GoToData"
                     style="@style/Preference"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="@string/data" />
+                    android:text="@string/settings_group_data" />
+
+                <TextView
+                    android:id="@+id/GoToAbout"
+                    style="@style/Preference"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/about" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
@@ -67,11 +88,13 @@
             android:visibility="gone">
 
             <LinearLayout
+                android:id="@+id/SectionAppearanceContent"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
 
                 <TextView
+                    android:id="@+id/AppearanceHeader"
                     style="@style/PreferenceHeader"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -94,23 +117,17 @@
                     layout="@layout/preference" />
 
                 <View
+                    android:id="@+id/AppearanceDivider"
                     android:layout_width="match_parent"
                     android:layout_height="1dp"
                     android:background="?android:attr/listDivider" />
 
                 <TextView
+                    android:id="@+id/BehaviourHeader"
                     style="@style/PreferenceHeader"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:text="@string/behaviour" />
-
-                <include
-                    android:id="@+id/NotesSortOrder"
-                    layout="@layout/preference" />
-
-                <include
-                    android:id="@+id/CheckedListItemSorting"
-                    layout="@layout/preference" />
 
                 <include
                     android:id="@+id/StartView"
@@ -158,6 +175,7 @@
             android:visibility="gone">
 
             <LinearLayout
+                android:id="@+id/SectionBackupContent"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
@@ -188,6 +206,20 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:text="@string/export_backup" />
+
+                <TextView
+                    android:id="@+id/ImportSettings"
+                    style="@style/Preference"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/import_settings" />
+
+                <TextView
+                    android:id="@+id/ExportSettings"
+                    style="@style/Preference"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/export_settings" />
 
                 <View
                     android:layout_width="match_parent"
@@ -221,6 +253,7 @@
             android:visibility="gone">
 
             <LinearLayout
+                android:id="@+id/SectionDataContent"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
@@ -249,20 +282,6 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:text="@string/settings" />
-
-                <TextView
-                    android:id="@+id/ImportSettings"
-                    style="@style/Preference"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="@string/import_settings" />
-
-                <TextView
-                    android:id="@+id/ExportSettings"
-                    style="@style/Preference"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="@string/export_settings" />
 
                 <TextView
                     android:id="@+id/ResetSettings"
@@ -303,6 +322,7 @@
             android:visibility="gone">
 
             <LinearLayout
+                android:id="@+id/SectionAboutContent"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"

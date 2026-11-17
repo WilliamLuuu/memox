@@ -207,4 +207,39 @@
         <item name="cornerSizeBottomLeft">0dp</item>
     </style>
 
+    <style name="ThemeOverlay.MemoX.Green" parent="">
+        <item name="colorPrimary">@color/preset_green_primary</item>
+        <item name="colorOnPrimary">@color/preset_green_onPrimary</item>
+        <item name="colorPrimaryContainer">@color/preset_green_primaryContainer</item>
+        <item name="colorOnPrimaryContainer">@color/preset_green_onPrimaryContainer</item>
+        <item name="colorSecondary">@color/preset_green_secondary</item>
+        <item name="colorTertiary">@color/preset_green_tertiary</item>
+    </style>
+
+    <style name="ThemeOverlay.MemoX.Blue" parent="">
+        <item name="colorPrimary">@color/preset_blue_primary</item>
+        <item name="colorOnPrimary">@color/preset_blue_onPrimary</item>
+        <item name="colorPrimaryContainer">@color/preset_blue_primaryContainer</item>
+        <item name="colorOnPrimaryContainer">@color/preset_blue_onPrimaryContainer</item>
+        <item name="colorSecondary">@color/preset_blue_secondary</item>
+        <item name="colorTertiary">@color/preset_blue_tertiary</item>
+    </style>
+
+    <style name="ThemeOverlay.MemoX.Purple" parent="">
+        <item name="colorPrimary">@color/preset_purple_primary</item>
+        <item name="colorOnPrimary">@color/preset_purple_onPrimary</item>
+        <item name="colorPrimaryContainer">@color/preset_purple_primaryContainer</item>
+        <item name="colorOnPrimaryContainer">@color/preset_purple_onPrimaryContainer</item>
+        <item name="colorSecondary">@color/preset_purple_secondary</item>
+        <item name="colorTertiary">@color/preset_purple_tertiary</item>
+    </style>
+
+    <style name="ThemeOverlay.MemoX.Orange" parent="">
+        <item name="colorPrimary">@color/preset_orange_primary</item>
+        <item name="colorOnPrimary">@color/preset_orange_onPrimary</item>
+        <item name="colorPrimaryContainer">@color/preset_orange_primaryContainer</item>
+        <item name="colorOnPrimaryContainer">@color/preset_orange_onPrimaryContainer</item>
+        <item name="colorSecondary">@color/preset_orange_secondary</item>
+        <item name="colorTertiary">@color/preset_orange_tertiary</item>
+    </style>
 </resources>

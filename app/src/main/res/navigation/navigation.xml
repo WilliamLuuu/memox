@@ -102,6 +102,26 @@
     </fragment>
 
     <fragment
+        android:id="@+id/SettingsEditing"
+        android:name="cool.hin.memox.presentation.activity.main.fragment.settings.SettingsFragment"
+        android:label="@string/settings_group_editing">
+        <argument
+            android:name="category"
+            android:defaultValue="editing"
+            app:argType="string" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/SettingsLists"
+        android:name="cool.hin.memox.presentation.activity.main.fragment.settings.SettingsFragment"
+        android:label="@string/settings_group_lists">
+        <argument
+            android:name="category"
+            android:defaultValue="lists"
+            app:argType="string" />
+    </fragment>
+
+    <fragment
         android:id="@+id/SettingsBackup"
         android:name="cool.hin.memox.presentation.activity.main.fragment.settings.SettingsFragment"
         android:label="@string/backup">

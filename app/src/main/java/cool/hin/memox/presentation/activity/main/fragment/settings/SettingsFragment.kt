@@ -2,6 +2,7 @@ package cool.hin.memox.presentation.activity.main.fragment.settings
 
 import android.content.ContextWrapper
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.Intent.ACTION_OPEN_DOCUMENT_TREE
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -16,6 +17,7 @@ import android.view.ViewGroup
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity.RESULT_OK
+import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
@@ -73,9 +75,13 @@ class SettingsFragment : Fragment() {
     private lateinit var setupLockActivityResultLauncher: ActivityResultLauncher<Intent>
     private lateinit var disableLockActivityResultLauncher: ActivityResultLauncher<Intent>
     private lateinit var exportSettingsActivityResultLauncher: ActivityResultLauncher<Intent>
+    private lateinit var exportJexActivityResultLauncher: ActivityResultLauncher<Intent>
     private lateinit var importSettingsActivityResultLauncher: ActivityResultLauncher<Intent>
 
     private lateinit var selectedImportSource: ImportSource
+
+    private var pendingExportPassword: String? = null
+    private var currentAppearanceTag: String? = null
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -91,6 +97,7 @@ class SettingsFragment : Fragment() {
             setupSecurity(binding)
             setupSettings(binding)
         }
+        setupAgentApi(binding)
         setupAbout(binding)
         applyCategory(binding)
         return binding.root
@@ -104,7 +111,19 @@ class SettingsFragment : Fragment() {
     private fun applyCategory(binding: FragmentSettingsBinding) {
         val category = arguments?.getString(EXTRA_SETTINGS_CATEGORY) ?: CATEGORY_ROOT
         when (category) {
-            CATEGORY_APPEARANCE -> showSection(binding, binding.SectionAppearance)
+            CATEGORY_APPEARANCE -> {
+                showSection(binding, binding.SectionAppearance)
+                applyAppearanceCategory(binding, "cat:display")
+            }
+            CATEGORY_EDITING -> {
+                showSection(binding, binding.SectionAppearance)
+                applyAppearanceCategory(binding, "cat:editing")
+                addSavePolicyRow(binding)
+            }
+            CATEGORY_LISTS -> {
+                showSection(binding, binding.SectionAppearance)
+                applyAppearanceCategory(binding, "cat:lists")
+            }
             CATEGORY_BACKUP -> showSection(binding, binding.SectionBackup)
             CATEGORY_DATA -> showSection(binding, binding.SectionData)
             CATEGORY_ABOUT -> showSection(binding, binding.SectionAbout)
@@ -118,11 +137,20 @@ class SettingsFragment : Fragment() {
                 binding.GoToAppearance.setOnClickListener {
                     findNavController().navigate(R.id.SettingsAppearance)
                 }
-                binding.GoToBackup.setOnClickListener {
+                binding.GoToEditing.setOnClickListener {
+                    findNavController().navigate(R.id.SettingsEditing)
+                }
+                binding.GoToSync.setOnClickListener {
                     findNavController().navigate(R.id.SettingsBackup)
+                }
+                binding.GoToLists.setOnClickListener {
+                    findNavController().navigate(R.id.SettingsLists)
                 }
                 binding.GoToData.setOnClickListener {
                     findNavController().navigate(R.id.SettingsData)
+                }
+                binding.GoToAbout.setOnClickListener {
+                    findNavController().navigate(R.id.SettingsAbout)
                 }
             }
         }
@@ -140,9 +168,242 @@ class SettingsFragment : Fragment() {
             if (section === binding.SectionAbout) View.VISIBLE else View.GONE
     }
 
+    private fun applyAppearanceCategory(binding: FragmentSettingsBinding, visibleTag: String) {
+        currentAppearanceTag = visibleTag
+        val container = binding.SectionAppearanceContent
+        for (index in 0 until container.childCount) {
+            val child = container.getChildAt(index)
+            val tag = child.tag as? String ?: continue
+            child.visibility = if (tag == visibleTag) View.VISIBLE else View.GONE
+        }
+        // Section headers belong to their own group only; otherwise every page repeats 显示/行为.
+        binding.AppearanceHeader.visibility =
+            if (visibleTag == "cat:display") View.VISIBLE else View.GONE
+        binding.AppearanceDivider.visibility =
+            if (visibleTag == "cat:display") View.VISIBLE else View.GONE
+        binding.BehaviourHeader.visibility =
+            if (visibleTag == "cat:editing" || visibleTag == "cat:lists") View.VISIBLE else View.GONE
+        binding.BehaviourHeader.setText(
+            when (visibleTag) {
+                "cat:editing" -> R.string.settings_group_editing
+                "cat:lists" -> R.string.settings_group_lists
+                else -> R.string.behaviour
+            },
+        )
+    }
+
+    private fun addSavePolicyRow(binding: FragmentSettingsBinding) {
+        val container = binding.SectionAppearanceContent
+        if (container.findViewWithTag<View>("savePolicy") != null) return
+        val row =
+            cool.hin.memox.databinding.PreferenceBinding.inflate(
+                layoutInflater,
+                container,
+                false,
+            )
+        row.root.tag = "cat:editing"
+        row.Title.setText(R.string.save_policy)
+        row.Value.text = getString(model.preferences.savePolicy.value.textResId)
+        row.root.setOnClickListener {
+            val values =
+                cool.hin.memox.presentation.viewmodel.preference.SavePolicy.entries.toList()
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle(R.string.save_policy)
+                .setSingleChoiceItems(
+                    values.map { getString(it.textResId) }.toTypedArray(),
+                    values.indexOf(model.preferences.savePolicy.value),
+                ) { dialog, which ->
+                    model.preferences.savePolicy.save(values[which])
+                    row.Value.text = getString(values[which].textResId)
+                    dialog.dismiss()
+                }
+                .show()
+        }
+        container.addView(row.root)
+    }
+
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         setupActivityResultLaunchers()
+    }
+
+    private fun setupAgentApi(binding: FragmentSettingsBinding) {
+        val row =
+            cool.hin.memox.databinding.PreferenceBinding.inflate(
+                layoutInflater,
+                binding.SectionDataContent,
+                false,
+            )
+        val preferences = model.preferences
+        row.Title.setText(R.string.agent_api_title)
+        // Monotonic generation so a delayed failure check only reports the most recent start.
+        var startGeneration = 0
+        val checkStartResult: (Int) -> Unit = { generation ->
+            row.root.postDelayed(
+                {
+                    if (view?.isAttachedToWindow == true &&
+                        generation == startGeneration &&
+                        !preferences.agentApiEnabled.value
+                    ) {
+                        android.widget.Toast
+                            .makeText(
+                                requireContext(),
+                                R.string.agent_api_host_invalid,
+                                android.widget.Toast.LENGTH_LONG,
+                            )
+                            .show()
+                    }
+                },
+                600,
+            )
+        }
+        val render = {
+            row.Value.text =
+                if (preferences.agentApiEnabled.value) {
+                    getString(R.string.agent_api_running_detail)
+                } else {
+                    getString(R.string.disabled)
+                }
+        }
+        // Bind status to the preference so a failed rebind/service start is reflected even when
+        // it originates from the foreground service, not from this row's click listener.
+        preferences.agentApiEnabled.observe(viewLifecycleOwner) { render() }
+        render()
+        row.root.setOnClickListener {
+            val enabled = !preferences.agentApiEnabled.value
+            preferences.agentApiEnabled.save(enabled)
+            if (enabled) {
+                val token =
+                    cool.hin.memox.data.agent.AgentApiServer(
+                            requireContext().applicationContext
+                                as android.content.ContextWrapper
+                        )
+                        .ensureToken()
+                val generation = ++startGeneration
+                cool.hin.memox.data.agent.AgentApiService.start(requireContext())
+                checkStartResult(generation)
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.agent_api_title)
+                    .setMessage(
+                        getString(R.string.agent_api_token) +
+                            ": " +
+                            token +
+                            "\n\n" +
+                            getString(
+                                R.string.agent_api_endpoint,
+                                cool.hin.memox.data.agent.AgentApiServer.formatEndpoint(
+                                    preferences.agentApiHost.value,
+                                ),
+                            )
+                    )
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+            } else {
+                cool.hin.memox.data.agent.AgentApiService.stop(requireContext())
+            }
+            render()
+        }
+        binding.SectionDataContent.addView(row.root)
+
+        val hostRow =
+            cool.hin.memox.databinding.PreferenceBinding.inflate(
+                layoutInflater,
+                binding.SectionDataContent,
+                false,
+            )
+        hostRow.Title.setText(R.string.agent_api_host)
+        hostRow.Value.text = preferences.agentApiHost.value
+        hostRow.root.setOnClickListener {
+            val input =
+                android.widget.EditText(requireContext()).apply {
+                    setText(preferences.agentApiHost.value)
+                    setSelection(text.length)
+                    hint = "127.0.0.1"
+                }
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle(R.string.agent_api_host)
+                .setMessage(R.string.agent_api_host_hint)
+                .setView(input)
+                .setPositiveButton(android.R.string.ok) { _, _ ->
+                    val host = input.text.toString().trim()
+                    val valid =
+                        host.isNotEmpty() &&
+                            runCatching {
+                                java.net.InetAddress.getByName(host)
+                            }.isSuccess
+                    if (!valid) {
+                        android.widget.Toast
+                            .makeText(
+                                requireContext(),
+                                R.string.agent_api_host_invalid,
+                                android.widget.Toast.LENGTH_LONG,
+                            )
+                            .show()
+                    } else {
+                        preferences.agentApiHost.save(host)
+                        hostRow.Value.text = host
+                        if (preferences.agentApiEnabled.value) {
+                            val generation = ++startGeneration
+                            cool.hin.memox.data.agent.AgentApiService.stop(requireContext())
+                            cool.hin.memox.data.agent.AgentApiService.start(requireContext())
+                            checkStartResult(generation)
+                        }
+                    }
+                }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
+        }
+        binding.SectionDataContent.addView(hostRow.root)
+    }
+
+    /**
+     * New archive password, entered twice. Empty input is rejected: an encrypted archive must not
+     * look protected while using an empty password, and the password is never persisted.
+     */
+    private fun promptExportPassword(onReady: (String?) -> Unit) {
+        val container =
+            android.widget.LinearLayout(requireContext()).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                val padding = (20 * resources.displayMetrics.density).toInt()
+                setPadding(padding, padding / 2, padding, 0)
+            }
+        fun field(hintRes: Int) =
+            android.widget.EditText(requireContext()).apply {
+                hint = getString(hintRes)
+                inputType =
+                    android.text.InputType.TYPE_CLASS_TEXT or
+                        android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                setSingleLine()
+            }
+        val password = field(R.string.archive_password_hint)
+        val confirmation = field(R.string.archive_password_confirm_hint)
+        container.addView(password)
+        container.addView(confirmation)
+        val dialog =
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle(R.string.archive_password_title)
+                .setMessage(R.string.archive_password_message)
+                .setView(container)
+                .setPositiveButton(android.R.string.ok, null)
+                .setNeutralButton(R.string.archive_password_none) { _, _ -> onReady(null) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val first = password.text.toString()
+                val second = confirmation.text.toString()
+                when {
+                    first.isEmpty() -> password.error = getString(R.string.archive_password_empty)
+                    first != second ->
+                        confirmation.error = getString(R.string.archive_password_mismatch)
+                    else -> {
+                        dialog.dismiss()
+                        onReady(first)
+                    }
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun setupActivityResultLaunchers() {
@@ -164,7 +425,12 @@ class SettingsFragment : Fragment() {
             registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 if (result.resultCode == RESULT_OK) {
                     result.data?.data?.let { uri ->
-                        model.exportBackup(uri) {
+                        model.exportBackup(
+                            uri,
+                            pendingExportPassword
+                                ?: cool.hin.memox.presentation.viewmodel.preference.Constants
+                                    .PASSWORD_EMPTY,
+                        ) {
                             // Continue with pending biometric action (enable/disable) after export
                             pendingBiometricContinuation?.invoke()
                             pendingBiometricContinuation = null
@@ -173,6 +439,12 @@ class SettingsFragment : Fragment() {
                 } else {
                     // User canceled export picker; do not keep a stale continuation around
                     pendingBiometricContinuation = null
+                }
+            }
+        exportJexActivityResultLauncher =
+            registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                if (result.resultCode == RESULT_OK) {
+                    result.data?.data?.let { uri -> model.exportJex(uri) }
                 }
             }
         setupLockActivityResultLauncher =
@@ -246,6 +518,150 @@ class SettingsFragment : Fragment() {
     }
 
     private fun MemoXPreferences.setupAppearance(binding: FragmentSettingsBinding) {
+        // Every row belongs to exactly one category page. Tags are consumed by
+        // applyAppearanceCategory so a setting can never leak onto another page.
+        binding.AppearanceHeader.tag = "cat:display"
+        binding.AppearanceDivider.tag = "cat:display"
+        binding.View.root.tag = "cat:display"
+        binding.Theme.root.tag = "cat:display"
+        binding.DateFormat.root.tag = "cat:display"
+        binding.TextSize.root.tag = "cat:display"
+
+        binding.BehaviourHeader.tag = "cat:header"
+        binding.LinkCard.root.tag = "cat:editing"
+        binding.CompressImages.root.tag = "cat:editing"
+        binding.CompressExistingImages.root.tag = "cat:editing"
+        run {
+            val row =
+                cool.hin.memox.databinding.PreferenceBinding.inflate(
+                    layoutInflater,
+                    binding.SectionAppearanceContent,
+                    false,
+                )
+            row.root.tag = "cat:editing"
+            row.Title.setText(R.string.markdown_default_format)
+            row.Value.text =
+                getString(
+                    if (markdownByDefault.value) R.string.markdown_use
+                    else R.string.markdown_use_rich,
+                )
+            val options = listOf(R.string.markdown_use, R.string.markdown_use_rich)
+            row.root.setOnClickListener {
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.markdown_default_format)
+                    .setSingleChoiceItems(
+                        options.map { getString(it) }.toTypedArray(),
+                        if (markdownByDefault.value) 0 else 1,
+                    ) { dialog, which ->
+                        markdownByDefault.save(which == 0)
+                        row.Value.text = getString(options[which])
+                        dialog.dismiss()
+                    }
+                    .show()
+            }
+            binding.SectionAppearanceContent.addView(
+                row.root,
+                binding.SectionAppearanceContent.indexOfChild(binding.CompressExistingImages.root) + 1,
+            )
+        }
+
+        binding.StartView.root.tag = "cat:lists"
+        binding.AutoEmptyBin.root.tag = "cat:lists"
+        binding.MaxLabels.root.tag = "cat:lists"
+        binding.LabelsHiddenInOverview.root.tag = "cat:lists"
+        run {
+            val row =
+                cool.hin.memox.databinding.PreferenceBinding.inflate(
+                    layoutInflater,
+                    binding.SectionAppearanceContent,
+                    false,
+                )
+            row.root.tag = "cat:display"
+            row.Title.setText(R.string.markdown_in_list)
+            row.Value.text =
+                getString(if (markdownInList.value) R.string.enabled else R.string.disabled)
+            row.root.setOnClickListener {
+                markdownInList.save(!markdownInList.value)
+                row.Value.text =
+                    getString(if (markdownInList.value) R.string.enabled else R.string.disabled)
+                recreatePreservingDestination()
+            }
+            binding.SectionAppearanceContent.addView(
+                row.root,
+                binding.SectionAppearanceContent.indexOfChild(binding.TextSize.root) + 1,
+            )
+        }
+
+        run {
+            val colorRow =
+                cool.hin.memox.databinding.PreferenceBinding.inflate(
+                    layoutInflater,
+                    binding.SectionAppearanceContent,
+                    false,
+                )
+            colorRow.root.tag = "cat:display"
+            colorRow.Title.setText(R.string.theme_color)
+            fun updateColorSummary() {
+                val color = ContextCompat.getColor(requireContext(), themeColor.value.colorResId)
+                colorRow.ColorPreview.visibility = View.VISIBLE
+                colorRow.ColorPreview.backgroundTintList = ColorStateList.valueOf(color)
+                colorRow.Value.text =
+                    "${getString(themeColor.value.textResId)}  ${
+                        String.format("#%06X", 0xFFFFFF and color)
+                    }"
+            }
+            updateColorSummary()
+            colorRow.root.setOnClickListener {
+                val values =
+                    cool.hin.memox.presentation.viewmodel.preference.ThemeColor.entries.toList()
+                val container =
+                    android.widget.LinearLayout(requireContext()).apply {
+                        orientation = android.widget.LinearLayout.VERTICAL
+                        setPadding(0, (8 * resources.displayMetrics.density).toInt(), 0, 0)
+                    }
+                // Dialog.setView() does not make its content scrollable. Five padded swatches
+                // plus title/buttons overflow on small or split screens, clipping the last colors.
+                val scrollView =
+                    android.widget.ScrollView(requireContext()).apply { addView(container) }
+                val dialog =
+                    MaterialAlertDialogBuilder(requireContext())
+                        .setTitle(R.string.theme_color)
+                        .setView(scrollView)
+                        .setCancelButton()
+                        .create()
+                values.forEach { value ->
+                    val option =
+                        cool.hin.memox.databinding.PreferenceBinding.inflate(
+                            layoutInflater,
+                            container,
+                            false,
+                        )
+                    option.Title.setText(value.textResId)
+                    option.Value.visibility = View.GONE
+                    option.ColorPreview.visibility = View.VISIBLE
+                    val color = ContextCompat.getColor(requireContext(), value.colorResId)
+                    option.ColorPreview.backgroundTintList = ColorStateList.valueOf(color)
+                    if (value == themeColor.value) {
+                        option.Title.setTypeface(
+                            option.Title.typeface,
+                            android.graphics.Typeface.BOLD,
+                        )
+                    }
+                    option.root.setOnClickListener {
+                        themeColor.save(value)
+                        dialog.dismiss()
+                        recreatePreservingDestination()
+                    }
+                    container.addView(option.root)
+                }
+                dialog.show()
+            }
+            binding.SectionAppearanceContent.addView(
+                colorRow.root,
+                binding.SectionAppearanceContent.indexOfChild(binding.Theme.root) + 1,
+            )
+        }
+
         notesView.observe(viewLifecycleOwner) { value ->
             binding.View.setup(notesView, value, requireContext()) { newValue ->
                 model.savePreference(notesView, newValue)
@@ -306,23 +722,6 @@ class SettingsFragment : Fragment() {
                 },
             )
         }
-        notesSorting.observe(viewLifecycleOwner) { notesSort ->
-            binding.NotesSortOrder.setup(
-                notesSorting,
-                notesSort,
-                requireContext(),
-                layoutInflater,
-                model,
-            )
-        }
-
-        listItemSorting.observe(viewLifecycleOwner) { value ->
-            binding.CheckedListItemSorting.setup(listItemSorting, value, requireContext()) {
-                newValue ->
-                model.savePreference(listItemSorting, newValue)
-            }
-        }
-
         autoRemoveDeletedNotesAfterDays.observe(viewLifecycleOwner) { value ->
             binding.AutoEmptyBin.setup(
                 autoRemoveDeletedNotesAfterDays,
@@ -383,9 +782,11 @@ class SettingsFragment : Fragment() {
             ) { enabled ->
                 model.savePreference(model.preferences.compressImagesOnInsert, enabled)
             }
-            // 依赖项：仅当主开关开启时才显示「压缩已有图片」。
+            // 依赖项：主开关开启且当前就在“编辑与保存”页时才显示「压缩已有图片」。
+            // 这里不能只看 value，否则观察者在 applyAppearanceCategory 之后触发，
+            // 会把已经隐藏的行重新显示到“显示”“列表与整理”页面上。
             binding.CompressExistingImages.root.visibility =
-                if (value) View.VISIBLE else View.GONE
+                if (value && currentAppearanceTag == "cat:editing") View.VISIBLE else View.GONE
         }
 
         model.preferences.compressExistingImages.observe(viewLifecycleOwner) { value ->
@@ -429,15 +830,43 @@ class SettingsFragment : Fragment() {
             }
             ImportOther.setOnClickListener { importFromOtherApp() }
             ExportBackup.setOnClickListener {
-                val intent =
-                    Intent(Intent.ACTION_CREATE_DOCUMENT)
-                        .apply {
-                            type = MIME_TYPE_ZIP
-                            addCategory(Intent.CATEGORY_OPENABLE)
-                            putExtra(Intent.EXTRA_TITLE, buildBackupTitle())
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.export_format_title)
+                    .setItems(
+                        arrayOf(
+                            getString(R.string.export_format_memox),
+                            getString(R.string.export_format_jex),
+                        )
+                    ) { _, which ->
+                        if (which == 0) {
+                            val intent =
+                                Intent(Intent.ACTION_CREATE_DOCUMENT)
+                                    .apply {
+                                        type = MIME_TYPE_ZIP
+                                        addCategory(Intent.CATEGORY_OPENABLE)
+                                        putExtra(Intent.EXTRA_TITLE, buildBackupTitle())
+                                    }
+                                    .wrapWithChooser(requireContext())
+                            promptExportPassword { password ->
+                                pendingExportPassword = password
+                                exportBackupActivityResultLauncher.launch(intent)
+                            }
+                        } else {
+                            val intent =
+                                Intent(Intent.ACTION_CREATE_DOCUMENT)
+                                    .apply {
+                                        type = MIME_TYPE_ZIP
+                                        addCategory(Intent.CATEGORY_OPENABLE)
+                                        putExtra(
+                                            Intent.EXTRA_TITLE,
+                                            buildBackupTitle().replace(".zip", ".jex"),
+                                        )
+                                    }
+                                    .wrapWithChooser(requireContext())
+                            exportJexActivityResultLauncher.launch(intent)
                         }
-                        .wrapWithChooser(requireContext())
-                exportBackupActivityResultLauncher.launch(intent)
+                    }
+                    .show()
             }
         }
         model.importProgress.setupImportProgressDialog(this@SettingsFragment)
@@ -710,6 +1139,35 @@ class SettingsFragment : Fragment() {
             SourceCode.setOnClickListener { openLink("https://cnb.cool/hin/memoX") }
             ViewLogs.setOnClickListener { (requireContext() as ContextWrapper).viewLogs() }
 
+            val noticesRow =
+                cool.hin.memox.databinding.PreferenceBinding.inflate(
+                    layoutInflater,
+                    SectionAboutContent,
+                    false,
+                )
+            noticesRow.Title.setText(R.string.third_party_licenses)
+            noticesRow.root.layoutParams =
+                android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
+            noticesRow.root.setOnClickListener {
+                val text =
+                    runCatching {
+                            requireContext().resources
+                                .openRawResource(R.raw.third_party_notices)
+                                .bufferedReader()
+                                .use { it.readText() }
+                        }
+                        .getOrDefault("")
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.third_party_licenses)
+                    .setMessage(text)
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+            }
+            SectionAboutContent.addView(noticesRow.root)
+
             try {
                 val pInfo =
                     requireContext().packageManager.getPackageInfo(requireContext().packageName, 0)
@@ -838,9 +1296,9 @@ class SettingsFragment : Fragment() {
     }
 
     private fun buildBackupTitle(): String {
-        val sdf = SimpleDateFormat("yyyy-MM-dd HH-mm", Locale.getDefault())
+        val sdf = SimpleDateFormat("yyyy-MM-dd_HH-mm", Locale.getDefault())
         val ts = sdf.format(Date())
-        return "memoX Backup $ts.zip"
+        return "memoX_Backup_$ts.zip"
     }
 
     private fun showBiometricsNotSetupDialog() {
@@ -886,12 +1344,22 @@ class SettingsFragment : Fragment() {
         openLink("https://crustack.github.io/memoX/docs/$docPath")
     }
 
+    private fun recreatePreservingDestination() {
+        pendingDestinationId = findNavController().currentDestination?.id
+        activity?.recreate()
+    }
+
     companion object {
         private const val TAG = "SettingsFragment"
+
+        /** Activity 重建后由 MainActivity 恢复当前设置子页，避免主题色切换后跳回上一级。 */
+        var pendingDestinationId: Int? = null
 
         const val EXTRA_SETTINGS_CATEGORY = "category"
         const val CATEGORY_ROOT = "root"
         const val CATEGORY_APPEARANCE = "appearance"
+        const val CATEGORY_EDITING = "editing"
+        const val CATEGORY_LISTS = "lists"
         const val CATEGORY_BACKUP = "backup"
         const val CATEGORY_DATA = "data"
         const val CATEGORY_ABOUT = "about"
